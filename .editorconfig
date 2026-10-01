@@ -1,0 +1,29 @@
+# 全仓库通用编辑器约定
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# C# 保持 4 空格；与现有代码风格一致（文件级命名空间、可空引用开启）
+[*.cs]
+indent_size = 4
+csharp_style_namespace_declarations = file_scoped:suggestion
+dotnet_sort_system_directives_first = true
+csharp_new_line_before_open_brace = all
+
+# 前端与测试脚本 2 空格
+[*.{js,mjs,css,html,json,yml,yaml}]
+indent_size = 2
+
+# Markdown 不做行尾空格裁剪（两个空格代表换行）
+[*.md]
+trim_trailing_whitespace = false
+
+# Windows 脚本用 CRLF
+[*.{ps1,bat,cmd}]
+end_of_line = crlf

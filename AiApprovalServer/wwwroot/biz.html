@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>星云游安全执行平台 · 业务对接台</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<div id="toast-host"></div>
+
+<!-- ============================ 顶部栏 ============================ -->
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-title">星云游安全执行平台</span>
+    <span class="brand-sub">AI 执行网关 · 业务对接台（甲方 / 乙方 / 管理员）</span>
+  </div>
+  <div class="topbar-spacer"></div>
+  <div class="userbox" id="userbox" hidden>
+    <span id="whoami" class="hint"></span>
+    <span id="rolebadge" class="badge info">-</span>
+    <span id="ai-badge" class="badge muted">AI 状态检测中</span>
+    <a class="hint" href="/">智能体对话</a>
+    <a class="hint" id="nav-admin" href="/admin" hidden>管理后台</a>
+    <button class="small ghost" id="btn-logout" type="button">退出登录</button>
+  </div>
+</header>
+
+<!-- ============================ 登录视图 ============================ -->
+<main id="login-view" class="login-wrap">
+  <div class="banner" id="login-banner">
+    本页面把甲方 / 乙方的对接业务做成结构化表单，但每一个写操作仍然走同一条安全链路：
+    先做请求签名，再由规则引擎做确定性硬校验，然后交 AI 安全审核，需要时转人工审批，审批通过后才真正执行；
+    执行前自动保存快照，出问题可由管理员一键回退。
+  </div>
+
+  <div class="card">
+    <div class="card-head">业务对接台 · 账号登录</div>
+    <div class="card-body">
+      <label class="field"><span>用户名</span><input type="text" id="login-user" autocomplete="username" maxlength="32"></label>
+      <label class="field"><span>口令</span><input type="password" id="login-pass" autocomplete="current-password" maxlength="128"></label>
+      <div class="row">
+        <button class="primary" id="btn-login" type="button">登录</button>
+        <a class="hint" href="/">前往智能体对话</a>
+      </div>
+      <p class="hint">
+        甲方（用户角色）自助注册后即可建立"我司档案"并提交需求单；乙方员工与管理员账号由管理员在后台分配。
+      </p>
+    </div>
+  </div>
+</main>
+
+<!-- ============================ 业务对接台 ============================ -->
+<main id="biz-view" class="layout" hidden>
+  <section class="col-main">
+    <div id="main-error"></div>
+
+    <!-- ------------------------- 甲方（用户角色） ------------------------- -->
+    <div id="role-user" hidden>
+      <div class="card">
+        <div class="card-head">
+          我司档案
+          <span class="spacer"></span>
+          <span id="profile-state" class="badge muted">检测中</span>
+        </div>
+        <div class="card-body" id="profile-body">加载中…</div>
+        <div class="card-body tight" id="profile-actions" hidden></div>
+      </div>
+
+      <div class="card" id="card-create" hidden>
+        <div class="card-head">
+          建立我司档案
+          <span class="spacer"></span>
+          <span class="badge warn">需人工审批</span>
+        </div>
+        <div class="card-body" id="create-form"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          我的需求单
+          <span class="spacer"></span>
+          <span id="req-count" class="badge info">0 条</span>
+        </div>
+        <div class="card-body" id="req-form"></div>
+        <div id="req-list">加载中…</div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">关于审批与回退</div>
+        <div class="card-body">
+          <p class="hint">
+            这里的每一个按钮都不是"直接改数据"：建档、改档案、提交需求单都会先变成一条受约束的工具调用，
+            由服务端规则引擎做确定性校验（谁能改、能改哪些字段、字段值是否合法），再由 AI 安全审核判断是否合理，
+            最后按策略转入人工审批。审批通过后才真正生效，并且执行前会自动保存快照，管理员可在后台一键回退。
+          </p>
+          <p class="hint">
+            也就是说：接口被绕过、AI 被注入说服、页面被改成"假装已批准"，都不会改变"谁来批准"这件事 ——
+            审批权始终在管理员手里。
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ------------------------- 乙方（员工角色） ------------------------- -->
+    <div id="role-staff" hidden>
+      <div class="card">
+        <div class="card-head">
+          客户档案
+          <span class="spacer"></span>
+          <span id="staff-client-count" class="badge info">0 家</span>
+        </div>
+        <div class="card-body">
+          <div class="row tight" id="client-filters">
+            <input type="text" id="filter-keyword" class="grow" placeholder="按客户名称 / 联系人 / 负责人搜索" maxlength="40">
+            <select id="filter-industry" class="grow"></select>
+            <select id="filter-level" class="grow"></select>
+            <select id="filter-status" class="grow"></select>
+            <button class="small ghost" id="btn-filter-reset" type="button">重置筛选</button>
+          </div>
+          <p class="hint">点击任意一行查看客户详情，并在详情里发起"修改客户信息 / 指派负责员工 / 为该客户提交需求单"。</p>
+        </div>
+        <div id="staff-client-table">加载中…</div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          需求池
+          <span class="spacer"></span>
+          <span id="staff-req-count" class="badge info">0 条</span>
+        </div>
+        <div class="card-body">
+          <p class="hint">需求单的维护（状态 / 预算 / 负责人等）同样要经过人工审批，执行前会记录旧值以便回退。</p>
+        </div>
+        <div id="staff-req-table">加载中…</div>
+      </div>
+    </div>
+
+    <!-- ------------------------- 管理员 ------------------------- -->
+    <div id="role-admin" hidden>
+      <div class="banner warn" id="admin-goto">
+        审批在管理后台完成 —— 请点右上角"管理后台"进入待审批页处理甲方 / 乙方提交的申请。
+        本页面只提供只读总览，管理员在这里没有任何写操作按钮，避免出现"页面自己批准自己"的情况。
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          只读总览
+          <span class="spacer"></span>
+          <a class="hint" href="/admin">进入管理后台待审批页</a>
+        </div>
+        <div class="card-body" id="admin-stats">加载中…</div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">客户档案（只读）</div>
+        <div id="admin-client-table">加载中…</div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">需求池（只读）</div>
+        <div id="admin-req-table">加载中…</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ------------------------- 侧栏 ------------------------- -->
+  <aside class="col-side">
+    <div class="card">
+      <div class="card-head">
+        我的操作与审批状态
+        <span class="spacer"></span>
+        <span id="task-count" class="badge info">0 条</span>
+      </div>
+      <div class="card-body tight">
+        <div class="row tight">
+          <button class="small ghost" id="btn-refresh-tasks" type="button">刷新</button>
+          <span class="hint">只显示最近 20 条，点击查看详情</span>
+        </div>
+      </div>
+      <div id="task-list">加载中…</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">办理说明</div>
+      <div class="card-body">
+        <p class="hint">
+          提交后会有三种结果：<span class="badge ok">已执行</span> 立即生效；
+          <span class="badge warn">待人工审批</span> 等管理员在后台处理；
+          <span class="badge bad">被拦截 / 被打回</span> 表示规则引擎或安全审核不允许，原因会写在记录里。
+        </p>
+        <div class="divider"></div>
+        <p class="hint">
+          字段规则：电话为 11 位手机号；日期为 yyyy-MM-dd；预算为数字（元）。
+          行业、等级、状态只能取下拉里的枚举值。
+        </p>
+        <div class="divider"></div>
+        <p class="hint">
+          需要"用一句话办事"时，可以回到 <a href="/">智能体对话</a>；
+          两者走的是同一套权限、审核与审批链路。
+        </p>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<!-- ============================ 弹层容器 ============================ -->
+<div id="modal-host"></div>
+
+<script src="/assets/crypto-lite.js"></script>
+<script src="/assets/net.js"></script>
+<script src="/assets/biz.js"></script>
+</body>
+</html>

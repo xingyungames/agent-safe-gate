@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>星云游安全执行平台 · 业务工作台</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<div id="toast-host"></div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-title">星云游安全执行平台</span>
+    <span class="brand-sub">AI 执行网关 · 业务工作台（用户 / 员工）</span>
+  </div>
+  <div class="topbar-spacer"></div>
+  <div class="userbox" id="userbox" hidden>
+    <span id="whoami" class="hint"></span>
+    <span id="rolebadge" class="badge info">-</span>
+    <a class="hint" href="/biz">业务对接台</a>
+    <a class="hint" href="/admin">管理后台入口</a>
+    <button id="btn-help" class="small ghost" type="button">使用说明</button>
+    <button id="btn-logout" class="small ghost" type="button">退出登录</button>
+  </div>
+</header>
+
+<!-- ============================ 登录 / 注册 ============================ -->
+<main id="login-view" class="login-wrap">
+  <div class="banner" id="env-banner">正在检测服务状态…</div>
+
+  <div class="card">
+    <div class="card-head">账号登录</div>
+    <div class="card-body">
+      <label class="field"><span>用户名</span><input type="text" id="login-user" autocomplete="username" maxlength="32"></label>
+      <label class="field"><span>口令</span><input type="password" id="login-pass" autocomplete="current-password" maxlength="128"></label>
+      <div class="row">
+        <button class="primary" id="btn-login" type="button">登录</button>
+        <button class="ghost" id="btn-show-register" type="button">注册新用户</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" id="register-card" hidden>
+    <div class="card-head">自助注册（仅“用户”角色）</div>
+    <div class="card-body">
+      <label class="field"><span>用户名（3-32 位字母数字下划线）</span><input type="text" id="reg-user" autocomplete="off" maxlength="32"></label>
+      <label class="field"><span>显示名称</span><input type="text" id="reg-display" autocomplete="off" maxlength="32"></label>
+      <label class="field"><span>口令（至少 10 位，含大小写字母 / 数字 / 符号中的三类）</span><input type="password" id="reg-pass" autocomplete="new-password" maxlength="128"></label>
+      <label class="field"><span>邮箱（可选，用于“通知我”时接收消息）</span><input type="email" id="reg-email" autocomplete="off" maxlength="128"></label>
+      <div class="row">
+        <button class="primary" id="btn-register" type="button">提交注册</button>
+        <button class="ghost" id="btn-hide-register" type="button">返回登录</button>
+      </div>
+      <p class="hint">员工与管理员角色由管理员在后台分配，自助注册无法获得更高权限。</p>
+    </div>
+  </div>
+
+  <p class="login-foot">
+    本工作台的所有写操作都需要带签名的请求；<br>
+    高危动作（删除文件、修改数据、发送通知、覆盖文件）会先提交人工审批，审批通过后才执行，且执行前自动保存快照可一键回退。
+  </p>
+</main>
+
+<!-- ============================ 工作台 ============================ -->
+<main id="console-view" class="layout" hidden>
+  <section class="col-main">
+    <div class="card">
+      <div class="card-head">
+        智能体对话
+        <span class="spacer"></span>
+        <span id="ai-mode" class="badge muted">检测中</span>
+      </div>
+      <div id="chat-log" class="chat-log"></div>
+      <div class="composer">
+        <label class="field">
+          <span>用一句话说明你要做的事（AI 会翻译成受控的工具调用，再由规则引擎与安全审核决定能否执行）</span>
+          <textarea id="chat-input" maxlength="2000" placeholder="例如：查询客户 等级=黄金"></textarea>
+        </label>
+        <div class="row">
+          <button class="primary" id="btn-send" type="button">发送</button>
+          <button class="ghost small" id="btn-reset-session" type="button">清空对话上下文</button>
+          <span class="hint" id="mode-hint"></span>
+        </div>
+        <div class="row tight" id="quick-chips"></div>
+      </div>
+    </div>
+  </section>
+
+  <aside class="col-side">
+    <div class="card">
+      <div class="tabs" id="side-tabs">
+        <button class="tab active" type="button" data-tab="tasks">我的任务</button>
+        <button class="tab" type="button" data-tab="files">我的文件</button>
+        <button class="tab" type="button" data-tab="notices">通知</button>
+        <button class="tab" type="button" data-tab="versions">版本与回退</button>
+        <button class="tab" type="button" data-tab="perm">权限与工具</button>
+      </div>
+      <div id="side-body" class="tab-body"></div>
+    </div>
+  </aside>
+</main>
+
+<!-- ============================ 弹层容器 ============================ -->
+<div id="modal-host"></div>
+
+<script src="/assets/crypto-lite.js"></script>
+<script src="/assets/net.js"></script>
+<script src="/assets/app.js"></script>
+</body>
+</html>

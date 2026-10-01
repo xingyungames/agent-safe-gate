@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>AiApproval</RootNamespace>
+    <AssemblyName>AiApprovalServer</AssemblyName>
+    <!-- 关闭全局化以缩小运行时依赖，本服务只输出/解析 UTF-8 与固定数字格式 -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!-- 开源仓库元信息；上传前把 RepositoryUrl 换成你的真实仓库地址 -->
+    <Version>1.0.0</Version>
+    <Authors>星涵</Authors>
+    <Company>星云游</Company>
+    <Product>AI Agent 安全执行与审批平台</Product>
+    <Description>企业级 AI Agent 安全执行与审批系统：规则引擎硬拦截 + AI 安全审核物理隔离 + 人工审批 + 快照回退 + 审计哈希链</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://github.com/your-account/AIServer</RepositoryUrl>
+  </PropertyGroup>
+
+  <!--
+    本服务刻意不引入任何第三方包：
+      * JWT 采用自实现的 HMAC-SHA256 紧凑序列化（避免引入 Microsoft.IdentityModel.* 的版本与算法混淆风险）
+      * 密码采用 PBKDF2-HMAC-SHA256，敏感字段采用 AES-256-GCM
+      * JSON 存储采用 System.Text.Json
+    依赖越少，可审计面积越小。
+  -->
+
+  <!-- 让构建输出目录直接可运行（wwwroot 一并复制，不必先 publish 才能起页面） -->
+  <ItemGroup>
+    <Content Update="wwwroot/**/*" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

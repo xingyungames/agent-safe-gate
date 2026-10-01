@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>星云游安全执行平台 · 管理后台</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<div id="toast-host"></div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-title">星云游安全执行平台 · 管理后台</span>
+    <span class="brand-sub">审批 / 回退 / 审计 / 用户 / 安全态势</span>
+  </div>
+  <div class="topbar-spacer"></div>
+  <div class="userbox" id="userbox" hidden>
+    <span id="whoami" class="hint"></span>
+    <span class="badge bad">管理员</span>
+    <a class="hint" href="/biz">业务对接台</a>
+    <a class="hint" href="/">业务工作台</a>
+    <button id="btn-logout" class="small ghost" type="button">退出登录</button>
+  </div>
+</header>
+
+<!-- ============================ 管理员登录 ============================ -->
+<main id="login-view" class="login-wrap">
+  <div class="banner warn" id="login-banner">
+    该页面是管理员专用入口，登录后所有操作都会写入带哈希链的审计日志。
+  </div>
+
+  <div class="card">
+    <div class="card-head">管理员登录</div>
+    <div class="card-body">
+      <label class="field"><span>管理员用户名</span><input type="text" id="login-user" autocomplete="username" maxlength="32"></label>
+      <label class="field"><span>口令</span><input type="password" id="login-pass" autocomplete="current-password" maxlength="128"></label>
+      <div class="row">
+        <button class="primary" id="btn-login" type="button">登录</button>
+        <span class="hint">连续失败会锁定账号并累计 IP 攻击分，达到阈值自动封禁。</span>
+      </div>
+    </div>
+  </div>
+</main>
+
+<!-- ============================ 后台主体 ============================ -->
+<main id="admin-view" hidden>
+  <div class="layout">
+    <section class="col-main">
+      <div class="card">
+        <div class="tabs" id="admin-tabs">
+          <button class="tab active" type="button" data-tab="overview">总览</button>
+          <button class="tab" type="button" data-tab="pending">待审批</button>
+          <button class="tab" type="button" data-tab="tasks">全部任务</button>
+          <button class="tab" type="button" data-tab="versions">版本与回退</button>
+          <button class="tab" type="button" data-tab="users">用户管理</button>
+          <button class="tab" type="button" data-tab="audit">审计日志</button>
+          <button class="tab" type="button" data-tab="outbox">出站通知</button>
+          <button class="tab" type="button" data-tab="datasets">业务数据</button>
+          <button class="tab" type="button" data-tab="security">安全态势</button>
+        </div>
+        <div class="tab-body" id="admin-body">加载中…</div>
+      </div>
+    </section>
+
+    <aside class="col-side">
+      <div class="card">
+        <div class="card-head">
+          管理端 AI 安全助手
+          <span class="spacer"></span>
+          <span class="hint">只读分析，无审批权</span>
+        </div>
+        <div id="ai-log" class="chat-log"></div>
+        <div class="composer">
+          <label class="field">
+            <span>提问（例如：现在有哪些待审批任务？帮我检索 admin 的审计记录）</span>
+            <textarea id="ai-input" maxlength="1000" placeholder="现在有哪些待审批任务？"></textarea>
+          </label>
+          <div class="row">
+            <button class="primary small" id="btn-ai-send" type="button">提问</button>
+            <span class="hint">助手只能读取，不能批准、不能执行、不能回滚</span>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </div>
+</main>
+
+<div id="modal-host"></div>
+
+<script src="/assets/crypto-lite.js"></script>
+<script src="/assets/net.js"></script>
+<script src="/assets/admin.js"></script>
+</body>
+</html>

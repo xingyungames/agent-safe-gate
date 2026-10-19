@@ -1,4 +1,19 @@
-#发票 OCR 真实联调冒烟
+"""M9 · 发票 OCR 真实联调冒烟（确定性版）
+=========================================================
+流程（单次真实模型调用，无任何试探请求）：
+  1) 魔数嗅探图片真实 MIME（JPEG/PNG/WebP），全链路一致传递
+  2) DeepSeek 视觉 OCR 识别发票 → 结构化字段（1 次真实调用，usage 回显）
+  3) OCR 字段直接组装确定性草稿（不走 preview 文本重解析）：
+     - 报销类型取 OCR rtype ∈ 白名单，否则用 --rtype 兜底
+     - 金额/发票日期/城市/发票号码/销售方直取
+  4) XiaoCaiAgent「确认提交」→ 写主表（含 发票信息）→ 上传发票附件
+  5) get_record 回读验证「发票附件」列已落库
+
+用法：
+  python tools/live_ocr_smoke.py 路径/发票.png --applicant 张三 --department 研发部 [--rtype 办公用品]
+前置：
+  .env 已填真实 DEEPSEEK_API_KEY（deepseek-flash）+ 飞书凭证；主表已加「发票信息」「发票附件」两列。
+"""
 from __future__ import annotations
 
 import argparse
@@ -25,7 +40,7 @@ load_env()
 
 
 def sniff_mime(raw: bytes) -> str:
-    #按魔数判断图片类型
+    """魔数嗅探：JPEG / PNG / WebP；未知默认 jpg（DeepSeek 文档支持三者）。"""
     if raw[:3] == b"\xff\xd8\xff":
         return "image/jpeg"
     if raw[:8] == b"\x89PNG\r\n\x1a\n":
@@ -35,14 +50,11 @@ def sniff_mime(raw: bytes) -> str:
     return "image/jpeg"
 
 
-#MIME 对应扩展名
 _MIME_EXT = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
-#白名单报销类型
 _INVOICE_TYPES = ("差旅费", "招待费", "办公用品", "交通费")
 
 
 def main() -> None:
-    #冒烟主流程
     ap = argparse.ArgumentParser(description="M9 发票 OCR 冒烟（确定性提交版）")
     ap.add_argument("image", help="发票照片路径（jpg/png/webp，≤8MB）")
     ap.add_argument("--applicant", default="张三")
@@ -74,7 +86,7 @@ def main() -> None:
     ext = _MIME_EXT[mime]
     image_b64 = base64.b64encode(raw).decode()
 
-    #OCR 识别 可选复用已有结果
+    # ---- 1) DeepSeek 视觉 OCR（唯一一次真实模型调用；--fields 复用时跳过）----
     if args.fields:
         import json
         f = json.loads(args.fields)
@@ -96,7 +108,7 @@ def main() -> None:
             print(f"   ⚠️ 警告：{result.warnings}")
         print(f"   usage：{result.usage}（本次识别计费依据）")
 
-    #按 OCR 字段直接拼草稿
+    # ---- 2) 确定性组装草稿（不走 preview 文本重解析）----
     rtype = f.get("rtype") or ""
     if rtype not in _INVOICE_TYPES:
         print(f"   ℹ️ OCR 类型「{rtype or '(空)'}」不在 4 类白名单，用 --rtype 兜底：{args.rtype}"
@@ -131,7 +143,7 @@ def main() -> None:
     llm = LLMAdapter(MockProvider(canned="ok"))
     agent = XiaoCaiAgent(llm, Retriever([]), feishu=feishu, table_id=table_id)
 
-    #确认提交 写表并传附件
+    # ---- 3) 确认提交（写表 + 附件上传）----
     print(f"\n📤 [2/3] 确认提交（草稿：类型={rtype} 金额={draft['amount']} "
           f"号码={draft['invoice_no'] or '(空)'} 日期={draft.get('date', '(空)')}）...")
     r2 = agent.route("确认提交", base_draft=draft,
@@ -142,7 +154,7 @@ def main() -> None:
         print("❌ 提交未成功（见上方回答）")
         return
 
-    #回读验证发票附件列
+    # ---- 4) 回读验证「发票附件」列 ----
     print(f"\n🔁 [3/4] 回读记录验证附件落库（record_id={rid}）...")
     try:
         rec = feishu.get_record(table_id, rid)

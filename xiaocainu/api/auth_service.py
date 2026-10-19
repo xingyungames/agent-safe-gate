@@ -1,4 +1,18 @@
-#认证运行时装配层
+"""
+M8 · 认证运行时（装配层）
+========================
+把 security/auth.py（纯函数）+ models/users.py（飞书用户表）+ security/guard.py（限流）
+装配成网关可用的 AuthService：login / verify / logout / 会话-用户绑定。
+
+设计要点
+---------
+- 登录限流**只计失败次数**（would_allow 预检 + 失败才 hit），正常登录不消耗配额；
+- 账号权威在主服务器 AiApprovalServer：登录先请主服务器判定口令，角色直接取主服务器
+  返回的（employee/finance/admin/superadmin），二次映射为界面三标签（员工/财务/管理员）；
+- token 校验用 AUTH_SECRET HMAC 验签，logout 走内存 jti 黑名单；
+- sid 绑定：服务端不再盲信 body 里的 session_id——某 sid 首次出现即绑定到当前用户，
+  后续同 sid 换用户 → 403（防会话串用/越权读取他人草稿与上下文）。
+"""
 from __future__ import annotations
 
 import os
@@ -8,46 +22,82 @@ from security.auth import TokenRevoker, issue_token, verify_token
 from security.guard import RateLimiter
 from models import users
 from models.feishu import FeishuBitableClient
+from . import backend_client
 
-#对外用户字段 不含口令哈希
+# 登录响应/前端展示用的用户字段（绝不含 密码哈希/盐）
 PUBLIC_USER_KEYS = ("工号", "姓名", "用户名", "角色")
 
-#主服务器四角色 -> 本网关三角色标签
-ROLE_LABELS = {"employee": "员工", "finance": "财务", "admin": "管理员", "superadmin": "管理员"}
+# 主服务器四角色 → 本网关三标签（superadmin 在界面上等同管理员）
+ROLE_LABELS = {
+    "employee": "员工",
+    "finance": "财务",
+    "admin": "管理员",
+    "superadmin": "管理员",
+}
 
 
 class AuthService:
-    #认证服务
     def __init__(self, user_store: users.UserStore, secret: str, ttl: int = 7200,
                  login_limiter: RateLimiter | None = None) -> None:
-        #装配用户表 密钥 限流器
         self.users = user_store
         self.secret = secret
         self.ttl = ttl
         self.login_limiter = login_limiter or RateLimiter(limit=5, window=300)
         self.revoker = TokenRevoker()
-        self.sid_bindings: dict = {}  #sid -> 用户名 内存级 重启即清
+        self.sid_bindings: dict = {}  # sid -> username（内存级，重启即清）
 
+    # -------------------------------------------------- 登录
     def login(self, username: str, password: str, client_ip: str = ""):
-        #登录 返回状态与载荷
+        """登录。返回 (http_status, payload)。失败只计失败次数的限流配额。
+
+        账号权威在主服务器 AiApprovalServer：登录先请主服务器判定口令，成功后再用
+        主服务器返回的账号资料（角色/姓名/工号）签发本网关会话；令牌缓存供后续
+        写请求做 HMAC 签名复用。主服务器 4xx 直接失败、不回落本地表；连不上时按
+        BACKEND_MODE 决定兜底（preferred 回本地表 / required 直接拒绝）。
+        """
         username = (username or "").strip()
         key = f"{username}|{client_ip}"
         if not self.login_limiter.would_allow(key):
             return 429, {"error": "登录尝试过于频繁，请几分钟后再试"}
 
-        #账号权威在主服务器：先由它判定口令
-        primary = self._login_via_backend(username, password or "")
-        if primary is not None:
-            status, claims, public, note = primary
-            if status != 200:
-                self.login_limiter.allow(key)  #仅失败计数
-                return status, {"error": note}
-            return self._issue(username, claims, public, note)
+        # ① 主服务器优先（账号权威）
+        if backend_client.enabled():
+            try:
+                user = backend_client.login(username, password)
+            except backend_client.BackendRejected as e:
+                # 口令错/账号停用/锁定/限流：业务结论，绝不回落本地表
+                return 401, {"error": str(e)}
+            except (backend_client.BackendUnavailable,
+                    backend_client.BackendSessionMissing) as e:
+                # 连不上/会话缺失：看模式
+                if backend_client.mode() == "required":
+                    return 503, {"error": f"主服务器不可达，已按 required 模式拒绝登录：{e}"}
+                return self._login_local(username, password, key)
+            # 成功：用主服务器下发的资料建 claims（角色以主服务器为准）
+            role = ROLE_LABELS.get((user.get("role") or "employee"), "员工")
+            claims = {
+                "username": user.get("userName") or username,
+                "name": user.get("displayName") or user.get("userName") or username,
+                "role": role,
+                "employee_id": user.get("employeeId") or "",
+            }
+            public = {
+                "工号": claims["employee_id"],
+                "姓名": claims["name"],
+                "用户名": claims["username"],
+                "角色": claims["role"],
+            }
+            return self._issue(username, claims, public,
+                               f"主服务器已校验（角色={role}，工号={claims['employee_id']}）")
 
-        #主服务器未启用或连不上：按本地用户表兜底（BACKEND_MODE=required 时上面已经拒绝）
+        # 未启用主服务器：纯本地用户表
+        return self._login_local(username, password, key)
+
+    def _login_local(self, username: str, password: str, key: str):
+        """本地飞书用户表兜底登录（仅 preferred 模式且主服务器不可达时）。"""
         item, err = users.authenticate(self.users, username, password or "")
         if err:
-            self.login_limiter.allow(key)  #仅失败计数
+            self.login_limiter.allow(key)  # 仅失败计数
             return 401, {"error": err}
         f = item["fields"]
         claims = {
@@ -60,71 +110,37 @@ class AuthService:
         return self._issue(username, claims, public, "本地用户表校验（主服务器未启用或不可达）")
 
     def _issue(self, username: str, claims: dict, public: dict, note: str):
-        #签发本地会话 token
+        """签发本地会话 token（登录成功统一出口；note 注明本次账号权威来源）。"""
         token = issue_token(claims, self.secret, self.ttl)
-        self.users.touch_last_login(claims.get("username") or username)  #失败静默忽略
+        self.users.touch_last_login(claims.get("username") or username)  # 失败静默，不影响登录
         payload = {
             "token": token,
-            "session_id": secrets.token_hex(8),  #服务端新生成的 sid
+            "session_id": secrets.token_hex(8),  # 服务端生成的新 sid，前端切换使用
             "user": public,
         }
         if note:
             payload["backend"] = note
         return 200, payload
 
-    @staticmethod
-    def _login_via_backend(username: str, password: str):
-        #先问主服务器 返回 None 表示要回落本地表
-        try:
-            from . import backend_client
-        except Exception:
-            return None
-        if not backend_client.enabled() or not password:
-            return None
-        required = backend_client.mode() == "required"
-        try:
-            user = backend_client.login(username, password)
-        except backend_client.BackendRejected as e:
-            #主服务器明确拒绝：口令错或账号不可用 一律不再回落
-            return 401, None, None, str(e) or "用户名或口令错误"
-        except backend_client.BackendError as e:
-            if required:
-                return 503, None, None, f"主服务器登录失败，已按 required 模式拒绝登录：{e}"
-            print(f"[backend] 主服务器不可用（{e}）；改用本地用户表校验")
-            return None
-        role = str((user or {}).get("role") or "")
-        claims = {
-            "username": (user or {}).get("userName") or username,
-            "name": (user or {}).get("displayName") or (user or {}).get("userName") or username,
-            "role": ROLE_LABELS.get(role, "员工"),
-            "employee_id": (user or {}).get("employeeId", ""),
-        }
-        public = {
-            "工号": claims["employee_id"],
-            "姓名": claims["name"],
-            "用户名": claims["username"],
-            "角色": claims["role"],
-        }
-        note = f"主服务器已校验（角色={claims['role']}，工号={claims['employee_id']}）"
-        return 200, claims, public, note
-
+    # -------------------------------------------------- 校验 / 登出
     def verify(self, token: str):
-        #校验 token
+        """校验 token。合法返回 claims；非法/过期/已登出返回 None。"""
         return verify_token(token or "", self.secret, revoked=self.revoker)
 
     def logout(self, token: str) -> bool:
-        #登出 把 jti 拉黑
+        """登出：把 jti 拉黑。返回是否成功校验过该 token。"""
         claims = verify_token(token or "", self.secret, revoked=self.revoker)
         if not claims:
             return False
         self.revoker.revoke(claims.get("jti", ""))
-        #清掉该用户的 sid 绑定
+        # 顺带清掉该用户的 sid 绑定，防残留
         self.sid_bindings = {s: u for s, u in self.sid_bindings.items()
                              if u != claims.get("username")}
         return True
 
+    # -------------------------------------------------- sid ↔ 用户绑定
     def bind_sid(self, sid: str, username: str):
-        #sid 首次出现即绑定用户
+        """首次使用某 sid 绑定到用户；同 sid 换用户拒绝。返回 (ok, error)。"""
         sid = (sid or "default")[:64]
         bound = self.sid_bindings.get(sid)
         if bound is None:
@@ -136,7 +152,7 @@ class AuthService:
 
 
 def build_auth():
-    #按 .env 装配认证服务
+    """按 .env 装配 AuthService。未配置 FEISHU_USER_TABLE_ID → None（网关 fail-closed 401）。"""
     table_id = os.getenv("FEISHU_USER_TABLE_ID", "")
     if not (os.getenv("FEISHU_APP_ID") and table_id):
         print("[M8][安全] 未配置 FEISHU_USER_TABLE_ID，认证墙处于关闭状态——"

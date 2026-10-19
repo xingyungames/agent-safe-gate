@@ -1,4 +1,12 @@
-#飞书客户端离线单测 不联网
+"""
+M3 飞书客户端单测（不联网、不使用真实密钥）
+=========================================
+用 FakeTransport 模拟飞书 HTTP 返回，验证：token 获取+缓存、批量写入、查询、
+错误码抛 FeishuError、字段屏蔽、token 过期续期。
+
+运行：
+    py -3 tests/test_feishu.py
+"""
 import os
 import sys
 import time
@@ -26,18 +34,17 @@ from models.env import load_env
 
 
 class FakeTransport:
-    #模拟飞书开放平台
+    """模拟飞书开放平台：记录请求次数，按设定返回固定 JSON。"""
 
     def __init__(self, token_resp=None, write_resp=None, list_resp=None, fields_resp=None,
                  get_resp=None, upload_resp=None):
-        #初始化各类请求计数
         self.n_token_calls = 0
         self.n_write_calls = 0
         self.n_list_calls = 0
         self.n_fields_calls = 0
         self.n_get_calls = 0
         self.n_upload_calls = 0
-        self.last_upload = None  #(方法 地址 头 数据)
+        self.last_upload = None  # (method, url, headers, data)
         self.token_resp = token_resp or {
             "code": 0,
             "msg": "ok",
@@ -58,7 +65,7 @@ class FakeTransport:
                 ]
             },
         }
-        #单条查询字段在 record 内
+        # 单条查询：真实结构是 data.record.fields（曾因读成 data.fields 导致单号恒空）
         self.get_resp = get_resp or {
             "code": 0,
             "msg": "ok",
@@ -80,13 +87,12 @@ class FakeTransport:
                 ]
             },
         }
-        #附件上传走 upload_all
+        # M9 附件上传：upload_all
         self.upload_resp = upload_resp or {
             "code": 0, "msg": "ok", "data": {"file_token": "boxcnenFakeToken123"},
         }
 
     def request(self, method, url, *, json=None, params=None, headers=None, data=None):
-        #按地址分派假响应
         if "tenant_access_token" in url:
             self.n_token_calls += 1
             return self.token_resp
@@ -102,7 +108,7 @@ class FakeTransport:
         if url.endswith("/fields"):
             self.n_fields_calls += 1
             return self.fields_resp
-        #单条查询要先于列表判断
+        # 单条查询：.../records/{record_id}（先于 list 判断，避免被 "/records" 前缀吞掉）
         if method == "GET" and "/records/" in url:
             self.n_get_calls += 1
             return self.get_resp
@@ -112,43 +118,43 @@ class FakeTransport:
         return {"code": 0, "msg": "ok", "data": {}}
 
 
+# ---------------------------------------------------------- 鉴权 + 缓存
 def test_token_fetch_and_cache():
-    #令牌缓存命中不重复请求
     fake = FakeTransport()
     c = FeishuBitableClient("app_id", "app_secret", "app_token", transport=fake)
     t1 = c._ensure_token()
-    t2 = c._ensure_token()  #未过期直接命中缓存
+    t2 = c._ensure_token()  # 未过期，应直接命中缓存，不再请求
     assert t1 == t2 == "t-abc"
     assert fake.n_token_calls == 1, "第二次应命中缓存，token 只请求 1 次"
     print("[PASS] test_token_fetch_and_cache")
 
 
+# ---------------------------------------------------------- token 过期续期
 def test_token_refresh_on_expire():
-    #令牌过期自动刷新
     fake = FakeTransport()
     c = FeishuBitableClient("app_id", "app_secret", "app_token", transport=fake,
-                           token_margin=0)  #间隔设为 0 便于测试
-    c._ensure_token()               #第一次获取
-    c._token_exp = time.time() - 1   #强制过期
-    c._ensure_token()               #过期后重新获取
+                           token_margin=0)  # margin=0 便于测试
+    c._ensure_token()               # 第一次获取（n=1）
+    c._token_exp = time.time() - 1   # 强制过期
+    c._ensure_token()               # 过期后再次请求（n=2）
     assert fake.n_token_calls == 2, "过期后应重新获取，共 2 次"
     print("[PASS] test_token_refresh_on_expire")
 
 
+# ---------------------------------------------------------- 批量写入
 def test_create_records_returns_ids():
-    #批量写记录返回 id 列表
     fake = FakeTransport()
     c = FeishuBitableClient("app_id", "app_secret", "app_token", transport=fake)
     recs = [build_reimbursement_record(rtype="差旅费", amount=500)]
     ids = c.create_records("tblX", recs)
     assert ids == ["rec_1", "rec_2"], f"应返回 record_id 列表, got {ids}"
     assert fake.n_write_calls == 1
-    #写请求带上鉴权头
+    # 写入请求应带 Bearer token（不校验具体值，只确认鉴权头被加上）
     print("[PASS] test_create_records_returns_ids")
 
 
+# ---------------------------------------------------------- 查询
 def test_list_records_returns_items():
-    #列表查询返回条目
     fake = FakeTransport()
     c = FeishuBitableClient("app_id", "app_secret", "app_token", transport=fake)
     items = c.list_records("tblX", page_size=10)
@@ -157,8 +163,9 @@ def test_list_records_returns_items():
     print("[PASS] test_list_records_returns_items")
 
 
+# ---------------------------------------------------------- 单条查询（真实嵌套结构）
 def test_get_record_parses_nested_record():
-    #单条查询解析嵌套字段
+    """真实响应字段在 data.record.fields；必须能取到 单号（曾读成 data.fields → 恒空）。"""
     fake = FakeTransport()
     c = FeishuBitableClient("app_id", "app_secret", "app_token", transport=fake)
     rec = c.get_record("tblX", "rec_1")
@@ -168,8 +175,8 @@ def test_get_record_parses_nested_record():
     print("[PASS] test_get_record_parses_nested_record")
 
 
+# ---------------------------------------------------------- 错误码 → FeishuError
 def test_error_code_raises_feishu_error():
-    #错误码抛 FeishuError
     fake = FakeTransport(
         token_resp={"code": 0, "msg": "ok", "tenant_access_token": "t", "expire": 7200},
         write_resp={"code": 9999, "msg": "权限不足"},
@@ -184,33 +191,33 @@ def test_error_code_raises_feishu_error():
     print("[PASS] test_error_code_raises_feishu_error")
 
 
+# ---------------------------------------------------------- 字段屏蔽
 def test_public_view_shields_internal():
-    #对外视图屏蔽内部字段
     rec = {"record_id": "rec_secret", "fields": {"单号": "BX1", "状态": "审批中", "未知字段": "x"}}
     view = public_view(rec)
     assert "record_id" not in view
-    assert "未知字段" not in view  #非业务字段也屏蔽
+    assert "未知字段" not in view  # 非业务字段也屏蔽
     assert view["单号"] == "BX1" and view["状态"] == "审批中"
     print("[PASS] test_public_view_shields_internal")
 
 
+# ---------------------------------------------------------- 报销单 schema 完整
 def test_reimbursement_schema_complete():
-    #报销单字段拼装完整
     rec = build_reimbursement_record(
         rtype="差旅费", amount=800, applicant="张三", date_str="2026/9/10"
     )
-    #只写业务字段 不含只读列
+    # build 写入 12 个业务字段（不含只读 单号 / 不存在的 工号 / 留待审核的 审核人）
     assert rec["报销类型"] == "差旅费" and rec["金额"] == 800
     assert rec["申请人"] == "张三"
     assert rec["状态"] == "待审核"
-    assert rec["票据状态"] == ""                 #未传默认空
-    assert isinstance(rec["发票日期"], int) and rec["发票日期"] > 0  #日期已转毫秒时间戳
+    assert rec["票据状态"] == ""                 # 未传 has_invoice 默认空
+    assert isinstance(rec["发票日期"], int) and rec["发票日期"] > 0  # 日期已转毫秒时间戳
     assert "单号" not in rec and "工号" not in rec and "审核人" not in rec
     print("[PASS] test_reimbursement_schema_complete")
 
 
+# ---------------------------------------------------------- 日期 → 毫秒时间戳
 def test_parse_date_to_ts():
-    #日期转毫秒时间戳
     ts = _parse_date_to_ts("2026/9/10")
     assert isinstance(ts, int) and ts > 0
     assert _parse_date_to_ts("") is None
@@ -218,8 +225,8 @@ def test_parse_date_to_ts():
     print("[PASS] test_parse_date_to_ts")
 
 
+# ---------------------------------------------------------- .env 加载器
 def test_load_env_explicit_path():
-    #按指定路径加载 env 文件
     import tempfile
 
     with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False, encoding="utf-8") as f:
@@ -227,7 +234,7 @@ def test_load_env_explicit_path():
         path = f.name
     os.environ.pop("XC_TEST_K", None)
     os.environ.pop("XC_TEST_Q", None)
-    os.environ["XC_TEST_EXISTING"] = "orig"  #已存在的变量保留
+    os.environ["XC_TEST_EXISTING"] = "orig"  # 已存在的变量不应被覆盖
     try:
         load_env(path)
         assert os.getenv("XC_TEST_K") == "hello", "load_env 应写入 XC_TEST_K"
@@ -241,8 +248,8 @@ def test_load_env_explicit_path():
     print("[PASS] test_load_env_explicit_path")
 
 
+# ---------------------------------------------------------- 字段探测
 def test_list_fields():
-    #探测表字段列表
     fake = FakeTransport()
     c = FeishuBitableClient("app_id", "app_secret", "app_token", transport=fake)
     fields = c.list_fields("tblX")
@@ -251,8 +258,9 @@ def test_list_fields():
     print("[PASS] test_list_fields")
 
 
+# ---------------------------------------------------------- M8/P5 字段名缓存 + schema 过滤
 def test_field_names_caching():
-    #字段名缓存与强制重探
+    """field_names：进程内缓存（二次调用不发 HTTP）；use_cache=False 强制重探。"""
     fake = FakeTransport()
     c = FeishuBitableClient("app_id", "app_secret", "app_token", transport=fake)
     names = c.field_names("tblX")
@@ -267,7 +275,7 @@ def test_field_names_caching():
 
 
 def test_filter_by_schema():
-    #按表结构过滤字段
+    """旧 14 字段表过滤掉 工号/审批意见/审批时间；新表全保留；空集合原样返回。"""
     rec = build_reimbursement_record(rtype="差旅费", amount=500, employee_id="E0001")
     assert rec.get("工号") == "E0001", "传入 employee_id 应写入工号"
     old_names = set(REIMBURSEMENT_FIELDS) - {"工号", "审批意见", "审批时间"}
@@ -280,7 +288,7 @@ def test_filter_by_schema():
 
 
 def test_build_record_employee_id_optional():
-    #工号可选不写键
+    """employee_id 不传/空 → 不写工号键（与旧表语义一致）。"""
     rec = build_reimbursement_record(rtype="差旅费", amount=500)
     assert "工号" not in rec
     rec2 = build_reimbursement_record(rtype="差旅费", amount=500, employee_id="")
@@ -288,8 +296,9 @@ def test_build_record_employee_id_optional():
     print("[PASS] test_build_record_employee_id_optional")
 
 
+# ---------------------------------------------------------- 企业标准枚举常量
 def test_enum_constants_complete():
-    #枚举常量数量与取值
+    """部门 11 / 城市 37；各枚举集合内容符合企业标准（与 TABLE_SETUP.md 一致）。"""
     assert len(DEPT_WHITELIST) == 11, f"部门应 11 个, got {len(DEPT_WHITELIST)}"
     assert len(CITY_WHITELIST) == 37, f"城市应 37 个, got {len(CITY_WHITELIST)}"
     assert set(ALLOWED_INVOICE) == {"有票", "无票", "未提"}
@@ -298,8 +307,9 @@ def test_enum_constants_complete():
     print("[PASS] test_enum_constants_complete")
 
 
+# ---------------------------------------------------------- 写前枚举强校验闸门
 def test_validate_enum_fields_passes_valid():
-    #合规枚举值不报错
+    """全部合规枚举值 → 无错误。"""
     rec = build_reimbursement_record(
         applicant="张三", department="研发部", rtype="差旅费", amount=800,
         has_invoice="有票", city="上海", compliance="通过", status="待审核",
@@ -309,25 +319,26 @@ def test_validate_enum_fields_passes_valid():
 
 
 def test_validate_enum_fields_rejects_bogus():
-    #非法枚举值被捕获
+    """任一字段出现非标准枚举值 → 报出 (字段, 非法值)；空值不报错。"""
     rec = build_reimbursement_record(
         applicant="张三", department="火星部", rtype="差旅费", amount=800,
         has_invoice="有票", city="上海", compliance="通过", status="待审核",
     )
     errs = dict(validate_enum_fields(rec))
     assert errs.get("部门") == "火星部", "应捕获非标准部门"
-    #再补一个脏城市复测
+    # 补一个脏城市复测
     rec["城市"] = "火星城"
     errs = dict(validate_enum_fields(rec))
     assert errs.get("城市") == "火星城", "应捕获非标准城市"
-    #空值不参与校验
+    # 空部门/空城市不参与校验（允许留空由追问补全）
     rec["部门"], rec["城市"] = "", ""
     assert validate_enum_fields(rec) == []
     print("[PASS] test_validate_enum_fields_rejects_bogus")
 
 
+# ---------------------------------------------------------- M9 附件上传（stdlib multipart）
 def test_reimbursement_fields_include_invoice_columns():
-    #发票新列已登记
+    """M9 新列已登记：发票信息(文本)/发票附件(附件)，旧表缺列由 filter_by_schema 兜底。"""
     assert "发票信息" in REIMBURSEMENT_FIELDS and "发票附件" in REIMBURSEMENT_FIELDS
     rec = build_reimbursement_record(rtype="差旅费", amount=500)
     rec_new = filter_by_schema(rec, set(REIMBURSEMENT_FIELDS))
@@ -339,7 +350,7 @@ def test_reimbursement_fields_include_invoice_columns():
 
 
 def test_build_multipart_format():
-    #multipart 报文结构
+    """multipart 报文结构：字段行 + 文件头 + 二进制体 + 结束边界。"""
     body = _build_multipart(
         fields={"file_name": "a.jpg", "size": "11"},
         file_field="file", filename="a.jpg", content_type="image/jpeg",
@@ -354,7 +365,7 @@ def test_build_multipart_format():
 
 
 def test_upload_attachment_offline():
-    #上传附件带鉴权头
+    """upload_attachment：multipart 报文 + 鉴权头 + 返回 file_token。"""
     fake = FakeTransport()
     c = FeishuBitableClient("app_id", "app_secret", "app_token", transport=fake)
     token = c.upload_attachment("fapiao.jpg", b"\xff\xd8\xff\xe0JPGDATA", "image/jpeg")
@@ -373,7 +384,7 @@ def test_upload_attachment_offline():
 
 
 def test_upload_attachment_guards():
-    #空内容超限错误码都报错
+    """空内容 / 超大附件 / 飞书错误码 都要大声报错。"""
     fake = FakeTransport(upload_resp={"code": 91403, "msg": "Forbidden"})
     c = FeishuBitableClient("app_id", "app_secret", "app_token", transport=fake)
     for fn, args in [
@@ -395,31 +406,24 @@ def test_upload_attachment_guards():
 
 
 def test_urllib_transport_request():
-    #真实 urllib 传输层请求
     import urllib.request as ur
 
     class FakeResp:
-        #假 HTTP 响应对象
         def __init__(self, body: str):
-            #保存响应体
             self._b = body.encode("utf-8")
 
         def __enter__(self):
-            #进入上下文
             return self
 
         def __exit__(self, *a):
-            #退出上下文
             return False
 
         def read(self):
-            #读出响应体
             return self._b
 
     captured = {}
 
     def fake_urlopen(req, timeout=None):
-        #替换 urlopen 抓取请求
         captured["req"] = req
         return FakeResp(_json.dumps({"code": 0, "msg": "ok", "data": {"x": 1}}))
 
@@ -438,7 +442,7 @@ def test_urllib_transport_request():
         ur.urlopen = orig
 
     assert resp == {"code": 0, "msg": "ok", "data": {"x": 1}}, resp
-    #请求体必须是合法 JSON
+    # 验证请求体是合法 JSON（json 模块未被 json 参数遮蔽）
     sent = captured["req"].data.decode("utf-8")
     assert '"app_id"' in sent, "请求体应是合法 JSON（json 模块不应被参数遮蔽）"
     print("[PASS] test_urllib_transport_request")

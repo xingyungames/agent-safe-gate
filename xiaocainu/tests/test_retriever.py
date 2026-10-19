@@ -1,4 +1,11 @@
-#检索器单测 用内置小语料
+"""
+M2 单测（不联网、不依赖外部文件）
+==============================
+用内置 mini 语料验证检索器：相关性排序、top_k 限制、空查询、上下文拼接。
+
+运行：
+    py -3 tests/test_retriever.py
+"""
 import os
 import sys
 
@@ -7,7 +14,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.retriever import Retriever, Chunk, format_context
 
 
-#内置迷你测试语料
 CORPUS = [
     Chunk(
         text="差旅费报销需提供：1) 出差审批单；2) 交通票据（火车票/机票）；3) 住宿发票；"
@@ -37,17 +43,15 @@ CORPUS = [
 
 
 def test_basic_retrieval():
-    #最相关块排第一
     r = Retriever(CORPUS)
     res = r.query("差旅费报销需要哪些凭证", top_k=3)
     assert res, "应返回结果"
-    #差旅费块应排第一
+    # 最相关应是差旅费那条（含独特词：出差审批单 / 住宿标准）
     assert "出差审批单" in res[0].text, f"最相关应为差旅费块, got {res[0].text[:20]}"
     print("[PASS] test_basic_retrieval")
 
 
 def test_top_k_limit():
-    #条数受限且分数降序
     r = Retriever(CORPUS)
     res = r.query("报销", top_k=2)
     assert len(res) <= 2
@@ -57,7 +61,6 @@ def test_top_k_limit():
 
 
 def test_empty_query():
-    #空查询返回空列表
     r = Retriever(CORPUS)
     assert r.query("") == []
     assert r.query("   ") == []
@@ -65,15 +68,13 @@ def test_empty_query():
 
 
 def test_unrelated_query_no_crash():
-    #无关查询不崩溃
     r = Retriever(CORPUS)
     res = r.query("今天天气怎么样", top_k=1)
-    assert isinstance(res, list)  #无关查询不崩溃
+    assert isinstance(res, list)  # 无关查询不应崩溃，正常返回列表
     print("[PASS] test_unrelated_query_no_crash")
 
 
 def test_format_context():
-    #上下文拼接带标记
     r = Retriever(CORPUS)
     res = r.query("差旅费住宿标准", top_k=3)
     ctx = format_context(res)

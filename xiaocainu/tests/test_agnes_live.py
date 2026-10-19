@@ -1,4 +1,14 @@
-#真打通测试 单次付费调用
+"""
+Agnes 真打通测试（付费 API，单次小调用）
+===============================
+前置：在 .env 填好 AGNES_API_KEY 且 LLM_PROVIDER=agnes（或直接用环境变量注入）。
+用法 A（.env 文件）：
+    Copy-Item .env.example .env      # 然后编辑填入 AGNES_API_KEY
+    py -3 tests/test_agnes_live.py   # 注意：VSCode 终端用 py -3 代替 python（避微软商店别名占位符）
+用法 B（免 .env，直接注入环境变量）：
+    $env:LLM_PROVIDER="agnes"; $env:AGNES_API_KEY="实际密钥"; python tests/test_agnes_live.py
+说明：本脚本仅做一次真实对话调用，用于验证 key / endpoint / 模型名是否正确。
+"""
 import os
 import sys
 
@@ -6,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def load_env(path: str = ".env") -> None:
-    #读 .env 只补未设置的键
+    """依赖-free 读取 .env 到环境变量（仅补未设置的键）。"""
     if not os.path.exists(path):
         print(f"[info] 未找到 {path}，改从当前环境变量读取")
         return
@@ -21,12 +31,10 @@ def load_env(path: str = ".env") -> None:
 
 
 def mask(s: str) -> str:
-    #遮蔽密钥 只留头尾
     return (s[:4] + "****" + s[-2:]) if s and len(s) > 6 else ("**" if s else "<空>")
 
 
 def main() -> None:
-    #跑一次真实对话调用
     print("===== Agnes 真打通测试 开始 =====")
     load_env()
     provider = os.getenv("LLM_PROVIDER", "")

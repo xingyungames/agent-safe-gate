@@ -1,4 +1,22 @@
-#发票 OCR 引擎 抽取结构化字段
+"""
+M9 · 发票 OCR 引擎（DeepSeek 视觉多模态）
+=========================================
+职责
+----
+- 调 DeepSeek 视觉模型（OpenAI 兼容 content 数组 + image_url base64）识别发票图片，
+  抽取结构化字段：金额 / 开票日期 / 发票号码 / 销售方 / 报销类型建议 / 城市。
+- 只做「抽取」不做「决策」：rtype/city 必须落在白名单枚举内（feishu.py 为唯一定义源），
+  无法确定的字段留空并给 warnings，由 B 分支追问用户补齐——绝不猜值写库。
+- 申请人/部门一律不由 OCR 产生（M8 身份约束，登录身份为准）。
+
+安全要点
+--------
+- extraction-only prompt + 输出 JSON 强校验，缓解发票内文字的提示注入。
+- 图片仅内存中转，本模块不落盘、不写日志带图。
+- 仅用户主动上传时才调用（计费纪律：usage 随结果回显，零试探调用）。
+
+离线可测：MockOcrEngine 零网络零成本；InvoiceOCREngine 可注入假 client 单测解析逻辑。
+"""
 from __future__ import annotations
 
 import base64
@@ -14,10 +32,10 @@ from .feishu import ALLOWED_TYPES, CITY_WHITELIST
 
 logger = logging.getLogger("xiaocai.ocr")
 
-#需要识别的日期格式
+# 与 agent._normalize_date / feishu._parse_date_to_ts 同源的日期格式族
 _DATE_FORMATS = ("%Y/%m/%d", "%Y-%m-%d", "%Y.%m.%d", "%Y年%m月%d日", "%Y%m%d")
 
-#抽取提示词 只输出 JSON
+# OCR 抽取 prompt：只输出 JSON；非发票图返回 {"error":"not_invoice"}
 _EXTRACT_PROMPT = (
     "你是企业财务发票识别引擎。请识别这张图片中的发票/收据/消费凭证关键字段，"
     "只输出一个 JSON 对象，不要输出任何其他文字：\n"
@@ -30,18 +48,17 @@ _EXTRACT_PROMPT = (
     "若图片不是发票/收据/消费凭证，只输出 {\"error\": \"not_invoice\"}。"
 )
 
-#输出字段白名单
+# 字段输出白名单：金额可空，其余字符串
 _OUTPUT_KEYS = ("amount", "invoice_date", "invoice_no", "seller", "rtype", "city")
 
 
-#OCR 业务错误基类
 class OCRError(Exception):
-    """OCR 业务错误。"""
+    """OCR 业务错误（非发票图 / 解析失败 / 引擎异常）。信息不含密钥。"""
 
 
 @dataclass
 class OCRResult:
-    #归一化 OCR 结果
+    """归一化 OCR 结果，供 API 层与 agent 统一消费。"""
     fields: Dict[str, object]
     warnings: List[str] = field(default_factory=list)
     usage: Dict = field(default_factory=dict)
@@ -51,7 +68,7 @@ class OCRResult:
 
     @property
     def invoice_info(self) -> str:
-        #拼成主表发票信息文本
+        """「发票号码；销售方」拼接文本，用于写主表「发票信息」列。"""
         parts = [str(self.fields.get("invoice_no") or "").strip(),
                  str(self.fields.get("seller") or "").strip()]
         return "；".join(p for p in parts if p)
@@ -59,17 +76,16 @@ class OCRResult:
 
 @runtime_checkable
 class OCREngine(Protocol):
-    #OCR 引擎接口
     name: str
 
     def extract(self, *, image_b64: str, content_type: str = "image/jpeg",
                 filename: str = "") -> OCRResult:
-        #抽取发票字段
         ...
 
 
+# ---------------------------------------------------- 解析与校验（纯函数，离线可测）
 def extract_json(text: str) -> dict:
-    #从文本里抠出 JSON
+    """健壮 JSON 抽取：剥 ```json 围栏 / 截取首尾花括号；失败抛 OCRError。"""
     if not text:
         raise OCRError("OCR 返回为空")
     s = text.strip()
@@ -87,7 +103,7 @@ def extract_json(text: str) -> dict:
 
 
 def normalize_invoice_date(raw: object) -> str:
-    #日期统一成 YYYY/M/D
+    """各种日期写法 → YYYY/M/D；无法解析返回空串。"""
     s = str(raw or "").strip()
     if not s:
         return ""
@@ -102,7 +118,11 @@ def normalize_invoice_date(raw: object) -> str:
 
 
 def sanitize_fields(parsed: dict) -> tuple[Dict[str, object], List[str]]:
-    #不合格枚举置空并告警
+    """模型输出 → 白名单字段 + warnings（大声暴露，不静默猜值）。
+
+    - rtype/city 必须命中枚举白名单，否则置空并警告（最终由用户补齐）。
+    - amount 必须是 0~1e7 的数字，否则 None 并警告。
+    """
     warnings: List[str] = []
     out: Dict[str, object] = {k: "" for k in _OUTPUT_KEYS}
     out["amount"] = None
@@ -135,7 +155,7 @@ def sanitize_fields(parsed: dict) -> tuple[Dict[str, object], List[str]]:
 
 
 def build_invoice_preview(fields: Dict[str, object]) -> str:
-    #字段拼成一句草稿话术
+    """把 OCR 字段转成一句话，喂给现有 B 分支 send(text) 预填草稿。"""
     parts: List[str] = ["我上传了发票，有发票"]
     if fields.get("amount") is not None:
         parts.append(f"金额{fields['amount']:g}元")
@@ -152,8 +172,9 @@ def build_invoice_preview(fields: Dict[str, object]) -> str:
     return "，".join(parts)
 
 
+# ---------------------------------------------------- 真实引擎（DeepSeek 视觉）
 class InvoiceOCREngine:
-    #DeepSeek 视觉接口 真实引擎
+    """DeepSeek 官方视觉 API（deepseek-flash，OpenAI 兼容 image_url content）。"""
 
     name = "deepseek-ocr"
 
@@ -166,15 +187,14 @@ class InvoiceOCREngine:
         timeout: int = 60,
         client=None,
     ) -> None:
-        #读配置并建 client
         cfg = get_ocr_config()
         self.model = model or cfg["model"]
         self.detail = detail or cfg["detail"]
         self.name = cfg["name"]
-        if client is not None:  #测试注入假 client
+        if client is not None:  # 测试注入假 client，零网络
             self._client = client
         else:
-            from openai import OpenAI  #延迟导入
+            from openai import OpenAI  # 延迟导入，测试/Mock 不依赖
             self._client = OpenAI(
                 base_url=base_url or cfg["base_url"],
                 api_key=api_key or cfg["api_key"],
@@ -183,7 +203,7 @@ class InvoiceOCREngine:
 
     @staticmethod
     def build_messages(image_b64: str, content_type: str = "image/jpeg") -> list:
-        #拼多模态消息
+        """OpenAI 兼容多模态 content：text + image_url(data URL base64)。"""
         return [{
             "role": "user",
             "content": [
@@ -197,7 +217,7 @@ class InvoiceOCREngine:
 
     def extract(self, *, image_b64: str, content_type: str = "image/jpeg",
                 filename: str = "") -> OCRResult:
-        #校验入参是合法 base64
+        # 轻量防呆：入参必须是合法 base64（大声报错，不静默兜底）
         try:
             base64.b64decode(image_b64, validate=True)
         except Exception as e:
@@ -205,7 +225,8 @@ class InvoiceOCREngine:
 
         t0 = time.time()
         try:
-            #关闭思考模式 抽取无需推理
+            # 关闭 thinking（DeepSeek V4 默认开启）：抽取任务不需要推理，否则思考吃掉
+            # max_tokens 预算会导致 content 为空（实战踩坑：曾致「OCR 返回为空」）
             resp = self._client.chat.completions.create(
                 model=self.model,
                 messages=self.build_messages(image_b64, content_type),
@@ -250,13 +271,13 @@ class InvoiceOCREngine:
                          model=self.model, provider=self.name, latency_ms=latency)
 
 
+# ---------------------------------------------------- Mock 引擎（离线/零成本）
 class MockOcrEngine:
-    #测试用假 OCR 零网络零成本
+    """测试用假 OCR：返回 canned 字段，记录调用，零网络零费用。"""
 
     name = "mock-ocr"
 
     def __init__(self, canned: Optional[Dict[str, object]] = None) -> None:
-        #默认假发票字段
         self.canned = canned if canned is not None else {
             "amount": 800.0,
             "invoice_date": "2026/10/1",
@@ -269,7 +290,6 @@ class MockOcrEngine:
 
     def extract(self, *, image_b64: str, content_type: str = "image/jpeg",
                 filename: str = "") -> OCRResult:
-        #记录调用并返回固定字段
         self.calls.append({"image_b64_len": len(image_b64),
                            "content_type": content_type, "filename": filename})
         fields, warnings = sanitize_fields(dict(self.canned))

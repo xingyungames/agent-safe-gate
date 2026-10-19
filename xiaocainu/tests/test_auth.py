@@ -1,4 +1,4 @@
-#认证模块单测 纯离线
+"""M8 认证模块单测（纯离线，零网络零凭证）。运行：python tests/test_auth.py"""
 from __future__ import annotations
 
 import sys
@@ -19,8 +19,9 @@ from security.guard import RateLimiter
 SECRET = "unit-test-secret-123"
 
 
+# ---------------------------------------------------------- 密码哈希
 def test_password_hash_random_salt():
-    #同一密码两次哈希盐不同
+    """同一密码两次哈希：盐随机不同、哈希不同，但各自都能校验通过。"""
     s1, h1 = hash_password("Passw0rd!")
     s2, h2 = hash_password("Passw0rd!")
     assert s1 != s2, "两次哈希的盐必须不同（防彩虹表）"
@@ -31,7 +32,7 @@ def test_password_hash_random_salt():
 
 
 def test_password_verify_rejects():
-    #错密码与坏哈希一律拒绝
+    """错误密码 / 哈希被篡改 / 非法 hex / 空值 → 一律 False 且不抛异常。"""
     s, h = hash_password("abc123")
     assert not verify_password("abc124", s, h), "错密码应拒绝"
     assert not verify_password("abc123", s, h[:-2] + "00"), "哈希被篡改应拒绝"
@@ -41,8 +42,9 @@ def test_password_verify_rejects():
     print("[PASS] test_password_verify_rejects")
 
 
+# ---------------------------------------------------------- token
 def test_token_roundtrip():
-    #签发后能校验还原声明
+    """签发→校验还原 claims；iat/exp/jti 自动补齐。"""
     tok = issue_token({"username": "zhangsan", "role": "员工"}, SECRET, ttl=600)
     claims = verify_token(tok, SECRET)
     assert claims is not None, "合法 token 应通过校验"
@@ -54,14 +56,13 @@ def test_token_roundtrip():
 
 
 def test_token_tamper_and_wrong_secret():
-    #改载荷换密钥缺点号都拒绝
+    """改 payload / 换密钥签名 / 缺点号 → 全部拒绝。"""
     tok = issue_token({"username": "zhangsan", "role": "员工"}, SECRET)
     body, sig = tok.rsplit(".", 1)
-    #篡改载荷换角色提权
+    # 篡改 payload（换角色提权）
     import base64, json
 
     def b64(d):
-        #base64url 编码 去掉等号
         return base64.urlsafe_b64encode(d).rstrip(b"=").decode()
 
     evil = b64(json.dumps({"username": "zhangsan", "role": "管理员", "exp": 9999999999},
@@ -74,8 +75,8 @@ def test_token_tamper_and_wrong_secret():
 
 
 def test_token_expired():
-    #过期与非法 ttl 都拒绝
-    tok = issue_token({"username": "a"}, SECRET, ttl=-5)  #已过期
+    """过期 token 拒绝；ttl 非法值不崩溃。"""
+    tok = issue_token({"username": "a"}, SECRET, ttl=-5)  # 已过期
     assert verify_token(tok, SECRET) is None, "过期 token 应拒绝"
     tok2 = issue_token({"username": "a"}, SECRET, ttl=600)
     assert verify_token(tok2, SECRET, now=9999999999) is None, "模拟时间前移后应过期"
@@ -83,7 +84,7 @@ def test_token_expired():
 
 
 def test_token_revoked():
-    #拉黑后 token 立即失效
+    """logout（jti 拉黑）后 token 立即失效；未拉黑的正常。"""
     revoker = TokenRevoker()
     tok1 = issue_token({"username": "a"}, SECRET)
     tok2 = issue_token({"username": "b"}, SECRET)
@@ -92,13 +93,14 @@ def test_token_revoked():
     revoker.revoke(c1["jti"])
     assert verify_token(tok1, SECRET, revoked=revoker) is None, "已撤销 token 应拒绝"
     assert verify_token(tok2, SECRET, revoked=revoker) is not None, "其他 token 不受影响"
-    #set 黑名单同样生效
+    # set 形式的 revoked 也应支持
     assert verify_token(tok1, SECRET, revoked={c1["jti"]}) is None, "set 黑名单同样生效"
     print("[PASS] test_token_revoked")
 
 
+# ---------------------------------------------------------- 登录限流（复用 guard.RateLimiter）
 def test_login_rate_limit():
-    #超限登录被限流拒绝
+    """登录限流：窗口内超过上限拒绝（按 用户名|IP 维度）。"""
     rl = RateLimiter(limit=3, window=60)
     key = "zhangsan|127.0.0.1"
     assert rl.allow(key) and rl.allow(key) and rl.allow(key), "前 3 次放行"
@@ -108,7 +110,7 @@ def test_login_rate_limit():
 
 
 def test_default_iterations_constant():
-    #迭代次数不低于 10 万
+    """迭代次数保持 100k（降迭代=降安全，防止无意改掉）。"""
     assert PBKDF2_ITERATIONS >= 100_000
     print("[PASS] test_default_iterations_constant")
 

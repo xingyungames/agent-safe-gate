@@ -232,7 +232,7 @@ B 分支**不直接落表**，而是两段式：
 | `AGNES_BASE_URL` / `AGNES_API_KEY` / `AGNES_MODEL` | 云端 Agnes（开发用免费档） | **必须用 `agnes-2.5-flash`**（2.0 已废弃报 No available channel） |
 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 飞书自建应用凭证 | **敏感，勿提交** |
 | `FEISHU_APP_TOKEN` | 多维表格 base id（app_token） | 敏感 |
-| `FEISHU_TABLE_ID` | 报销单主表 `tbl...`（例 `<报销单主表_table_id>`；建好 V2 企业级表后换成新表 id） | 敏感表 id |
+| `FEISHU_TABLE_ID` | 报销单主表 `tbl...`（例 `tbl5Dz4SdKmmwgP5`；建好 V2 企业级表后换成新表 id） | 敏感表 id |
 | `FEISHU_USER_TABLE_ID` | **M8 用户表** `tbl...`（账号/角色/密码哈希存这张表） | 未配置 → 认证墙 fail-closed（全部 401） |
 | `AUTH_SECRET` | **M8 HMAC 签名密钥**（生成：`python -c "import secrets;print(secrets.token_hex(32))"`） | **敏感**；缺失则启动用临时密钥并告警（重启全体掉线） |
 | `AUTH_TOKEN_TTL` | token 有效期秒数（默认 7200=2h） | |
@@ -267,7 +267,7 @@ B 分支**不直接落表**，而是两段式：
 | `max_turns` | 20 | 保留最大消息数（防无限增长） |
 | 存储 | 进程内内存字典 | **不落库、不持久化、重启即失**（数据最小化） |
 
-### 6.5 飞书主表 schema（旧表 `<报销单主表_table_id>` 14 字段；**V2 企业级表 17 字段，含完整枚举**）
+### 6.5 飞书主表 schema（旧表 `tbl5Dz4SdKmmwgP5` 14 字段；**V2 企业级表 17 字段，含完整枚举**）
 
 `事由 / 单号 / 合规结果 / 审核人 / 报销类型 / 记录提交时间 / 状态 / 申请人 / 票据状态 / 部门 / 金额 / 风险摘要 / 城市 / 发票日期`
 

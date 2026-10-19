@@ -1,6 +1,6 @@
 from .env import load_env
 
-load_env()  #加载项目根 .env
+load_env()  # 加载项目根 .env（若存在），使 FEISHU_*/LLM_* 等环境变量生效
 
 from .llm import (
     LLMAdapter,

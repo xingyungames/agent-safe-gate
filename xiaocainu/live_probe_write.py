@@ -1,4 +1,14 @@
-#临时脚本 探测字段并试写全字段
+"""
+真实飞书探测 + 一次性全字段写入（临时脚本，测完可删）
+=================================================
+流程：
+  1) 用 .env 凭证初始化 FeishuBitableClient（verbose 打印原始回传）
+  2) list_fields 探测表结构（字段名/类型/单选选项）
+  3) 按字段类型生成测试值，跳过只读/复杂字段（公式、关联、人员等）
+  4) batch_create 一次性写入所有可写字段
+  5) get_record 读回核验
+注意：凭证只从 .env 读取；本脚本不写死任何密钥。
+"""
 import os
 import sys
 import time
@@ -13,15 +23,14 @@ TYPE_NAME = {
     17: "位置", 20: "公式", 21: "双向关联", 22: " lookup(关联)",
     1001: "货币", 1002: "进度", 1003: "邮箱",
 }
-#可安全生成测试值的类型
+# 可写且能安全生成测试值的类型
 HANDLED = {1, 2, 3, 4, 5, 7, 13, 15, 1001, 1002, 1003}
-#只读或复杂字段 跳过
+# 只读/复杂，跳过避免写入报错
 SKIP = {11, 20, 21, 22}
 SKIP_MARK = object()
 
 
 def gen_value(f):
-    #按字段类型生成测试值
     t = f.get("type")
     name = f.get("field_name")
     prop = f.get("property") or {}
@@ -33,17 +42,17 @@ def gen_value(f):
         return 1.23
     if t == 1002:
         return 50
-    if t == 3:  #单选写选项名字符串
+    if t == 3:  # 单选：飞书要求值为「选项名字符串」，不是 {"text":...}
         opts = prop.get("options") or []
         if not opts:
-            return SKIP_MARK  #无选项 跳过
+            return SKIP_MARK  # 无选项的单选字段无法安全写入，跳过
         return opts[0]["name"]
-    if t == 4:  #多选写选项名列表
+    if t == 4:  # 多选：值为选项名字符串列表
         opts = prop.get("options") or []
         if not opts:
             return SKIP_MARK
         return [opts[0]["name"]]
-    if t == 5:  #日期写毫秒时间戳
+    if t == 5:  # 日期：毫秒时间戳
         return int(time.time() * 1000)
     if t == 7:
         return True
@@ -57,7 +66,6 @@ def gen_value(f):
 
 
 def main():
-    #探测字段 一次性写入后回读
     table_id = os.getenv("FEISHU_TABLE_ID", "")
     assert table_id, "缺少 FEISHU_TABLE_ID"
     client = FeishuBitableClient(
@@ -65,7 +73,7 @@ def main():
         os.getenv("FEISHU_APP_SECRET"),
         os.getenv("FEISHU_APP_TOKEN"),
         verbose=True,
-    )  #凭证已加载
+    )  # 已 load_env()
 
     print("===== 1) 探测字段 =====")
     fields = client.list_fields(table_id)

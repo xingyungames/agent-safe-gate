@@ -1,11 +1,17 @@
-#只读探测飞书表 再写示例数据
+"""
+小财奴 · 真实飞书表联调验证（只读探测 + 写示例数据）
+=================================================
+用途：把用户新建的两张飞书表与 docs/TABLE_SETUP.md 的枚举设计逐字比对，并写入示例数据验证端到端。
+安全：探测为只读（list_fields）；写示例为极小批量（主表 2 条 + 用户表 3 条），且写入前打印将要写的值。
+运行：py live_verify.py   （需真实凭证在 .env；飞书调用需关闭沙箱）
+"""
 from __future__ import annotations
 
 import os
 import sys
 import time
 
-#Windows 控制台 UTF-8 兼容
+# Windows 控制台 UTF-8 兼容（避免 emoji/中文编码崩溃）
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stdout.reconfigure = sys.stdout.reconfigure  # noqa
@@ -33,7 +39,7 @@ MAIN_TABLE = os.getenv("FEISHU_TABLE_ID", "")
 USER_TABLE = os.getenv("FEISHU_USER_TABLE_ID", "")
 
 
-#期望的单选枚举值
+# 期望的单选枚举（与 docs/TABLE_SETUP.md 逐字一致）
 EXPECTED_SS = {
     "报销类型": {"差旅费", "招待费", "办公用品", "交通费"},
     "票据状态": {"有票", "无票", "未提"},
@@ -48,7 +54,6 @@ TYPE_NAME = {1: "文本", 2: "数字", 3: "单选", 5: "日期", 1005: "自动�
 
 
 def probe_table(client, table_id, label):
-    #探测表字段并比对单选枚举
     print(f"\n{'='*60}\n📋 探测 [{label}]  table_id={table_id}\n{'='*60}")
     try:
         fields = client.list_fields(table_id)
@@ -71,11 +76,11 @@ def probe_table(client, table_id, label):
         tname = TYPE_NAME.get(ftype, str(ftype))
         opt_str = f"  选项={opts}" if opts else ""
         print(f"   - {fname}  [{tname}]{opt_str}")
-    #比对单选枚举
+    # 比对单选枚举
     print("\n  —— 单选枚举比对 ——")
     for fname, want in EXPECTED_SS.items():
         if fname not in names:
-            #表里可能没有该字段
+            # 该表可能不含此字段（如用户表无城市）
             continue
         got = ss_found.get(fname)
         if got is None:
@@ -99,10 +104,9 @@ def probe_table(client, table_id, label):
 
 
 def write_samples(client, main_table, user_table):
-    #写入示例数据验证端到端
     print(f"\n{'='*60}\n📝 写入示例数据\n{'='*60}")
 
-    #主表示例 走完整链路
+    # ---- 主表示例 1：走完整 agent 流水线（验证抽取→归一→枚举校验→写表）----
     print("\n[主表示例1] 通过 XiaoCaiAgent 完整链路提交一张差旅费单")
     llm = LLMAdapter(MockProvider(canned="ok"))
     ret = Retriever([])
@@ -114,7 +118,7 @@ def write_samples(client, main_table, user_table):
     if r2.get("record_id"):
         print(f"   答案片段：{(r2.get('answer') or '')[:120].replace(chr(10),' ')}")
 
-    #主表示例 招待费走风险枚举
+    # ---- 主表示例 2：直接构造（招待费 2500 有票 → 合规结果=风险，演示枚举值）----
     print("\n[主表示例2] 直接构造一张招待费单（金额>2000 → 合规结果=风险）")
     rec2 = build_reimbursement_record(
         applicant="钱会计", department="财务部", rtype="招待费", amount=2500,
@@ -123,7 +127,7 @@ def write_samples(client, main_table, user_table):
         status="待审核", employee_id="E0002",
     )
     rec2 = filter_by_schema(rec2, client.field_names(main_table))
-    enum_errs = []  #本地枚举闸门
+    enum_errs = []  # 本地枚举闸门（与落库前一致）
     from models.feishu import validate_enum_fields
     enum_errs = validate_enum_fields(rec2)
     print(f"   写前枚举校验：{'通过' if not enum_errs else enum_errs}")
@@ -133,7 +137,7 @@ def write_samples(client, main_table, user_table):
     except FeishuError as e:
         print(f"   ❌ 写入失败：{e}")
 
-    #用户表示例 只写口令哈希
+    # ---- 用户表示例：3 个演示账号（密码哈希由脚本生成，明文不落表）----
     print("\n[用户表示例] 写入 员工/财务/管理员 各 1 个演示账号")
     demos = [
         ("E0001", "张三", "zhangsan", "研发部", "员工", "test123456"),
@@ -154,7 +158,6 @@ def write_samples(client, main_table, user_table):
 
 
 def readback(client, main_table, user_table):
-    #回读确认写入结果
     print(f"\n{'='*60}\n🔍 回读确认\n{'='*60}")
     try:
         mains = client.list_records(main_table, page_size=10)
@@ -179,14 +182,13 @@ def readback(client, main_table, user_table):
 
 
 def main():
-    #鉴权后依次探测写入回读
     print("🔧 小财奴 真实飞书表联调验证")
     if not (APP_ID and APP_SECRET and APP_TOKEN and MAIN_TABLE and USER_TABLE):
         print("❌ 缺少飞书凭证：请确认 .env 中 FEISHU_APP_ID/SECRET/TOKEN/TABLE_ID/USER_TABLE_ID")
         return
     try:
         client = FeishuBitableClient(APP_ID, APP_SECRET, APP_TOKEN)
-        #先换 token 验证凭证可读
+        # 触发一次 token 换取以验证凭证与 base 可读
         client._ensure_token()
         print("✅ 飞书鉴权成功（app_token 可达）")
     except FeishuError as e:

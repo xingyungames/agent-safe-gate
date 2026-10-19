@@ -1,4 +1,10 @@
-#探测两张表 自动识别主表用户表
+"""
+小财奴 · 新表联调探针（自动识别主表/用户表 + 探测 + 试写 + 回读）
+================================================================
+用法：py probe_new.py   （需真实凭证在 .env；飞书调用需关闭沙箱）
+特点：先探测两张表的字段，按「报销类型」字段自动判定谁是主表谁是用户表，
+      避免 URL 顺序搞反导致写错表。写前过枚举闸门；写入极小批量。
+"""
 from __future__ import annotations
 
 import os
@@ -27,8 +33,8 @@ load_env()
 APP_ID = os.getenv("FEISHU_APP_ID", "")
 APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
 APP_TOKEN = os.getenv("FEISHU_APP_TOKEN", "")
-T1 = os.getenv("FEISHU_TABLE_ID", "")        #表一 待判定
-T2 = os.getenv("FEISHU_USER_TABLE_ID", "")   #表二 待判定
+T1 = os.getenv("FEISHU_TABLE_ID", "")        # 第一个 URL 的表
+T2 = os.getenv("FEISHU_USER_TABLE_ID", "")   # 第二个 URL 的表
 
 EXPECTED_SS = {
     "报销类型": {"差旅费", "招待费", "办公用品", "交通费"},
@@ -44,7 +50,6 @@ TYPE_NAME = {1: "文本", 2: "数字", 3: "单选", 5: "日期", 1005: "自动�
 
 
 def probe(client, table_id):
-    #探测表字段并收集单选选项
     try:
         fields = client.list_fields(table_id)
     except FeishuError as e:
@@ -63,7 +68,6 @@ def probe(client, table_id):
 
 
 def compare(names, ss_found, label):
-    #比对单选枚举差异
     problems = []
     print(f"\n  —— [{label}] 单选枚举比对 ——")
     for fname, want in EXPECTED_SS.items():
@@ -89,10 +93,9 @@ def compare(names, ss_found, label):
 
 
 def write_samples(client, main_table, user_table):
-    #试写示例数据验证链路
     print(f"\n{'='*60}\n📝 试写示例数据\n{'='*60}")
 
-    #主表示例 招待费走风险枚举
+    # 主表示例：招待费 2500 → 合规结果=风险（直接构造，命中枚举闸门）
     print("\n[主表] 写一张招待费单（金额>2000 → 合规结果=风险）")
     rec = build_reimbursement_record(
         applicant="钱会计", department="财务部", rtype="招待费", amount=2500,
@@ -109,7 +112,7 @@ def write_samples(client, main_table, user_table):
     except FeishuError as e:
         print(f"   ❌ 主表写入失败：{e}")
 
-    #用户表示例 只写口令哈希
+    # 用户表：3 个演示账号
     print("\n[用户表] 写 员工/财务/管理员 各 1 个演示账号")
     demos = [
         ("E0001", "张三", "zhangsan", "研发部", "员工", "test123456"),
@@ -130,7 +133,6 @@ def write_samples(client, main_table, user_table):
 
 
 def readback(client, main_table, user_table):
-    #回读确认写入结果
     print(f"\n{'='*60}\n🔍 回读确认\n{'='*60}")
     try:
         mains = client.list_records(main_table, page_size=10)
@@ -154,7 +156,6 @@ def readback(client, main_table, user_table):
 
 
 def main():
-    #鉴权后探测比对 再试写回读
     print("🔧 小财奴 新表联调探针")
     if not (APP_ID and APP_SECRET and APP_TOKEN and T1 and T2):
         print("❌ 缺少飞书凭证（FEISHU_APP_ID/SECRET/TOKEN/TABLE_ID/USER_TABLE_ID）")
@@ -184,7 +185,7 @@ def main():
     print(f"\n{'='*60}\n📋 探测 [主表] {main_table}\n{'='*60}")
     for f in (n1 if is_main1 else n2):
         pass
-    #打印主表字段
+    # 打印主表字段
     mn, ms = (n1, s1) if is_main1 else (n2, s2)
     print(f"  字段：{mn}")
     pm = compare(mn, ms, "主表")

@@ -172,6 +172,7 @@
         <p>企业财务报销助手 · 政策咨询 / 填单引导 / 合规预审 / 进度查询</p>
       </div>
       <div class="spacer"></div>
+      <a class="reset-btn" id="finLink" href="/finance" style="display:none" title="财务/管理员：审核报销单据（经安全审计主服务器）">财务审核台</a>
       <div class="user-badge" id="userBadge">
         <span class="who" id="whoAmI"></span>
         <button class="logout-btn" id="logoutBtn">退出</button>
@@ -250,6 +251,9 @@
     const preChip = document.querySelector('[data-chip="pre"]');
     const canPre = currentUser && (currentUser.角色 === "财务" || currentUser.角色 === "管理员");
     if (preChip) preChip.style.display = canPre ? "" : "none";
+    // 🛡️ 财务审核台入口同样仅财务/管理员可见（与预审按钮同一套角色判断）
+    const finLink = document.getElementById("finLink");
+    if (finLink) finLink.style.display = canPre ? "" : "none";
   }
 
   function showLogin(message) {
@@ -287,6 +291,9 @@
         sessionStorage.setItem("xc_user", JSON.stringify(currentUser));
         if (data.session_id) sessionId = data.session_id;  // 切到服务端生成的新会话
         loginPwdEl.value = "";
+        // 角色落地：财务/管理员登录后直接进入财务审核台
+        const role = (currentUser && (currentUser.角色 || currentUser.role)) || "";
+        if (role === "财务" || role === "管理员") { location.replace("/finance"); return; }
         applyAuthUI();
         resetChatToWelcome();
         addMessage("bot", "✅ 登录成功，欢迎您，" + (currentUser && (currentUser.姓名 || currentUser.用户名) || "") + "！");
@@ -622,6 +629,17 @@
   // 初始渲染欢迎语 + 应用登录态（有 token 直接进主界面，无 token 弹登录遮罩）
   addMessage("bot", WELCOME_HTML);
   applyAuthUI();
+
+  // 角色落地：财务/管理员进聊天页即无条件转去财务审核台。
+  // 聊天填单仅限员工（服务端 /chat /ocr /reimburse 有同一道角色门），
+  // 聊天填单仅限员工（服务端 /chat /ocr /reimburse 有同一道角色门），
+  // 因此一律弹回，不再有任何「放行」标志。
+  try {
+    const role = (currentUser && (currentUser.角色 || currentUser.role)) || "";
+    if (role === "财务" || role === "管理员") {
+      location.replace("/finance");
+    }
+  } catch (e) {}
 
   inputEl.focus();
 </script>

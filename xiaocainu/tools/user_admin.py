@@ -1,4 +1,18 @@
-#管理员账号管理 CLI
+"""
+M8 · 管理员账号管理 CLI（最小闭环）
+==================================
+密码哈希只能在脚本端生成写入（表里永远没有明文，也严禁手填哈希列）。
+管理员通过命令行管账号，不建 Web 管理 UI（最小权限 + 凭据不落前端）。
+
+用法（在 xiaocainu 项目根目录执行）：
+    python tools/user_admin.py add    --username zhangsan --name 张三 --role 员工 [--eid E0001] [--password ***]
+    python tools/user_admin.py reset  --username zhangsan [--password ***]
+    python tools/user_admin.py disable --username zhangsan
+    python tools/user_admin.py enable --username zhangsan
+    python tools/user_admin.py list
+
+依赖 .env：FEISHU_APP_ID / FEISHU_APP_SECRET / FEISHU_APP_TOKEN / FEISHU_USER_TABLE_ID
+"""
 from __future__ import annotations
 
 import argparse
@@ -8,12 +22,11 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models.feishu import FeishuBitableClient, FeishuError  # noqa: E402
+from models.feishu import FeishuBitableClient, FeishuError  # noqa: E402  (import models 触发 .env 加载)
 from models import users  # noqa: E402
 
 
 def _build_store() -> users.UserStore:
-    #按配置建账号表客户端
     table_id = os.getenv("FEISHU_USER_TABLE_ID", "")
     if not (os.getenv("FEISHU_APP_ID") and table_id):
         print("❌ 缺少配置：请确认 .env 已填 FEISHU_APP_ID / FEISHU_APP_SECRET / "
@@ -24,7 +37,6 @@ def _build_store() -> users.UserStore:
 
 
 def _ask_password(args) -> str:
-    #取口令 缺省时交互输入
     pwd = args.password
     if not pwd:
         pwd = getpass.getpass("请输入密码：")
@@ -39,12 +51,10 @@ def _ask_password(args) -> str:
 
 
 def cmd_add(args) -> None:
-    #新增账号
     store = _build_store()
     if store.get_by_username(args.username):
         print(f"❌ 用户名已存在：{args.username}")
         sys.exit(1)
-    #口令只存哈希
     rec = users.make_user_record(
         username=args.username, name=args.name,
         role=args.role, password=_ask_password(args), employee_id=args.eid,
@@ -59,7 +69,6 @@ def cmd_add(args) -> None:
 
 
 def cmd_reset(args) -> None:
-    #重置指定账号口令
     store = _build_store()
     try:
         users.reset_password(store, args.username, _ask_password(args))
@@ -73,7 +82,6 @@ def cmd_reset(args) -> None:
 
 
 def cmd_status(args) -> None:
-    #启用或停用账号
     store = _build_store()
     try:
         name = users.set_user_status(store, args.username, enabled=args.action == "enable")
@@ -87,7 +95,6 @@ def cmd_status(args) -> None:
 
 
 def cmd_list(args) -> None:
-    #列出全部账号
     store = _build_store()
     try:
         rows = store.list_users()
@@ -105,7 +112,6 @@ def cmd_list(args) -> None:
 
 
 def main() -> None:
-    #命令行入口 注册子命令
     parser = argparse.ArgumentParser(description="小财奴账号管理 CLI（仅管理员使用）")
     sub = parser.add_subparsers(dest="action", required=True)
 

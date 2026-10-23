@@ -177,8 +177,8 @@ public static class AgentApi
         if (identity is null) return Api.Error(401, "UNAUTHENTICATED", "请先登录");
 
         var ip = Api.Ip(context);
-        if (!guard.TryConsume($"chat:user:{identity.User.Id}", cfg.Limits.AgentChatPerFiveMinutesPerUser, TimeSpan.FromMinutes(5))
-            || !guard.TryConsume($"chat:ip:{ip}", cfg.Limits.AgentChatPerFiveMinutesPerIp, TimeSpan.FromMinutes(5)))
+        if (!guard.TryConsume($"chat:user:{identity.User.Id}", cfg.Limits.AgentChatPerFiveMinutesPerUser, TimeSpan.FromMinutes(5), ip)
+            || !guard.TryConsume($"chat:ip:{ip}", cfg.Limits.AgentChatPerFiveMinutesPerIp, TimeSpan.FromMinutes(5), ip))
         {
             await audit.WriteAsync(identity.User.Id, identity.User.UserName, identity.User.Role, ip,
                 "agent.rate-limit", "chat", "BLOCKED", "对话频率超限（防 AI 额度被刷）");

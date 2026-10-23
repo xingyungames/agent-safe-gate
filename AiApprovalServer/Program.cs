@@ -50,7 +50,7 @@ builder.Services.AddSingleton(new JsonStore(cfg.DataRoot));
 builder.Services.AddSingleton<AuditLog>();
 builder.Services.AddSingleton<JwtService>();
 builder.Services.AddSingleton<ApprovalSigner>();
-builder.Services.AddSingleton(new SecurityGuard(cfg.Limits, cfg.NonceWindowSeconds));
+builder.Services.AddSingleton(new SecurityGuard(cfg.Limits, cfg.NonceWindowSeconds, cfg.AllowlistIps));
 builder.Services.AddSingleton<FeishuApi>();
 builder.Services.AddSingleton<FeishuMirror>();
 builder.Services.AddSingleton<InvoiceService>();
@@ -64,6 +64,7 @@ builder.Services.AddSingleton<RuleEngine>();
 builder.Services.AddSingleton<TaskService>();
 builder.Services.AddSingleton<ChatSessionStore>();
 builder.Services.AddSingleton<AiClient>();
+builder.Services.AddSingleton<InvoiceAiService>();
 builder.Services.AddSingleton<AgentOrchestrator>();
 builder.Services.AddHostedService<MaintenanceService>();
 
@@ -139,11 +140,12 @@ app.Use(async (context, next) =>
     {
         var guard = context.RequestServices.GetRequiredService<SecurityGuard>();
         var identity = context.Items[SecurityMiddleware.IdentityKey] as RequestIdentity;
+        var clientIp = SecurityGuard.ClientIp(context);
         var key = identity is null
-            ? $"read:ip:{SecurityGuard.ClientIp(context)}"
+            ? $"read:ip:{clientIp}"
             : $"read:user:{identity.User.Id}";
 
-        if (!guard.TryConsume(key, cfg.Limits.ReadPerMinutePerUser, TimeSpan.FromMinutes(1)))
+        if (!guard.TryConsume(key, cfg.Limits.ReadPerMinutePerUser, TimeSpan.FromMinutes(1), clientIp))
         {
             //超限直接拒绝
             context.Response.StatusCode = 429;
@@ -182,10 +184,17 @@ var indexFile = Path.Combine(app.Environment.WebRootPath, "index.html");
 var adminFile = Path.Combine(app.Environment.WebRootPath, "admin.html");
 var financeFile = Path.Combine(app.Environment.WebRootPath, "finance.html");
 
-app.MapGet("/", () => Results.File(indexFile, "text/html; charset=utf-8"));
-app.MapGet("/index.html", () => Results.File(indexFile, "text/html; charset=utf-8"));
-app.MapGet("/admin", () => Results.File(adminFile, "text/html; charset=utf-8"));
-app.MapGet("/finance", () => Results.File(financeFile, "text/html; charset=utf-8"));
+//页面不缓存，改完 html 刷新就生效
+static IResult Page(HttpContext ctx, string path)
+{
+    ctx.Response.Headers.CacheControl = "no-store";
+    return Results.File(path, "text/html; charset=utf-8");
+}
+
+app.MapGet("/", (HttpContext ctx) => Page(ctx, indexFile));
+app.MapGet("/index.html", (HttpContext ctx) => Page(ctx, indexFile));
+app.MapGet("/admin", (HttpContext ctx) => Page(ctx, adminFile));
+app.MapGet("/finance", (HttpContext ctx) => Page(ctx, financeFile));
 //带斜杠的路径重定向
 app.MapGet("/admin/{*rest}", () => Results.Redirect("/admin"));
 app.MapGet("/finance/{*rest}", () => Results.Redirect("/finance"));

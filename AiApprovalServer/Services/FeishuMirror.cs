@@ -59,6 +59,11 @@ public sealed class FeishuMirror
     {
         if (!Enabled) return MirrorResult.Skip("飞书未配置");
 
+        //镜像是 best-effort：用独立短超时，绝不能因为飞书慢而拖住注册/登录（报销单读写才用 30 秒）
+        using var mirrorCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        mirrorCts.CancelAfter(TimeSpan.FromMilliseconds(Math.Max(500, _cfg.Feishu.MirrorTimeoutMs)));
+        ct = mirrorCts.Token;
+
         var prepared = PrepareCredentials(user, realPassword);
         try
         {

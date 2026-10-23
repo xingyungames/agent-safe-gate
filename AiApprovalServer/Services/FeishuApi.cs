@@ -11,11 +11,18 @@ public sealed class FeishuApiException : Exception
     public int Code { get; }
     public string Stage { get; }
 
-    public FeishuApiException(string stage, int code, string msg, Exception? inner = null)
+    /// <summary>
+    /// true = 请求可能已经在飞书侧生效（超时 / 连接中断 / 响应读到一半断开）。
+    /// 写操作遇到这种情况**绝不能重试**，只能靠调用方回查确认，否则会重复写单。
+    /// </summary>
+    public bool UnknownState { get; }
+
+    public FeishuApiException(string stage, int code, string msg, Exception? inner = null, bool unknownState = false)
         : base($"{stage}失败 code={code} msg={msg}", inner)
     {
         Stage = stage;
         Code = code;
+        UnknownState = unknownState;
     }
 }
 
@@ -40,7 +47,8 @@ public sealed class FeishuApi
         _http = new HttpClient(new SocketsHttpHandler
         {
             PooledConnectionLifetime = TimeSpan.FromMinutes(2),
-            ConnectTimeout = TimeSpan.FromMilliseconds(Math.Max(500, cfg.Feishu.TimeoutMs)),
+            //建连保持短超时（连不上就是网络问题，不必等满 30 秒）；读写用完整的 TimeoutMs
+            ConnectTimeout = TimeSpan.FromMilliseconds(Math.Clamp(cfg.Feishu.TimeoutMs, 500, 5000)),
         })
         {
             Timeout = TimeSpan.FromMilliseconds(Math.Max(500, cfg.Feishu.TimeoutMs)),
@@ -118,7 +126,7 @@ public sealed class FeishuApi
         var token = await TokenAsync(ct).ConfigureAwait(false);
         var url = $"{_cfg.Feishu.BaseUrl}/open-apis/bitable/v1/apps/{_cfg.Feishu.AppToken}" +
                   $"/tables/{tableId}/records";
-        var json = await JsonAsync(() => Authorized(HttpMethod.Post, url, token, new { fields }), "新增记录", token, ct).ConfigureAwait(false);
+        var json = await JsonAsync(() => Authorized(HttpMethod.Post, url, token, new { fields }), "新增记录", token, ct, mutating: true).ConfigureAwait(false);
 
         if (json.TryGetProperty("data", out var data) && data.TryGetProperty("record", out var rec)
             && rec.TryGetProperty("record_id", out var rid))
@@ -142,7 +150,7 @@ public sealed class FeishuApi
         var token = await TokenAsync(ct).ConfigureAwait(false);
         var url = $"{_cfg.Feishu.BaseUrl}/open-apis/bitable/v1/apps/{_cfg.Feishu.AppToken}" +
                   $"/tables/{tableId}/records/{recordId}";
-        await JsonAsync(() => Authorized(HttpMethod.Put, url, token, new { fields }), "更新记录", token, ct).ConfigureAwait(false);
+        await JsonAsync(() => Authorized(HttpMethod.Put, url, token, new { fields }), "更新记录", token, ct, mutating: true).ConfigureAwait(false);
         return true;
     }
 
@@ -152,7 +160,7 @@ public sealed class FeishuApi
         var token = await TokenAsync(ct).ConfigureAwait(false);
         var url = $"{_cfg.Feishu.BaseUrl}/open-apis/bitable/v1/apps/{_cfg.Feishu.AppToken}" +
                   $"/tables/{tableId}/records/{recordId}";
-        await JsonAsync(() => Authorized(HttpMethod.Delete, url, token), "删除记录", token, ct).ConfigureAwait(false);
+        await JsonAsync(() => Authorized(HttpMethod.Delete, url, token), "删除记录", token, ct, mutating: true).ConfigureAwait(false);
         return true;
     }
 
@@ -194,7 +202,10 @@ public sealed class FeishuApi
         => new(AppJson.Serialize(body), Encoding.UTF8, "application/json");
 
     //发送并校验响应（重试时重建请求对象）
-    private async Task<JsonElement> JsonAsync(Func<HttpRequestMessage> factory, string stage, string token, CancellationToken ct)
+    //mutating=true 表示写操作（新增/修改/删除）：这类请求不幂等，
+    //一旦出现超时或连接中断就「可能已经生效」，此时重试会直接造成重复写单，因此一律不重试。
+    private async Task<JsonElement> JsonAsync(Func<HttpRequestMessage> factory, string stage, string token,
+        CancellationToken ct, bool mutating = false)
     {
         using (var probe = factory())
         {
@@ -216,6 +227,11 @@ public sealed class FeishuApi
             catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or IOException)
             {
                 last = ex;
+
+                //写操作：结果未知，立即放弃并标记，交给上层回查对账（绝不重试）
+                if (mutating)
+                    throw new FeishuApiException(stage, -1, Describe(ex), ex, unknownState: true);
+
                 if (i < attempts - 1) await Task.Delay(200, ct).ConfigureAwait(false);
             }
         }

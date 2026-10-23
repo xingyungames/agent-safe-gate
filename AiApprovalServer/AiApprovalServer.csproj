@@ -18,6 +18,15 @@
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <RepositoryType>git</RepositoryType>
     <RepositoryUrl>https://github.com/xingyungames/agent-safe-gate</RepositoryUrl>
+    <!--
+      发布约定：前端（wwwroot）与 appsettings.json 必须保持为**松散文件**，
+      部署后可以直接在服务器上改，不需要重新编译。因此禁止单文件/裁剪发布：
+        PublishSingleFile=false （不把资源打进可执行文件）
+        PublishTrimmed=false    （不裁剪，避免反射与静态资源探测失效）
+    -->
+    <PublishSingleFile>false</PublishSingleFile>
+    <PublishTrimmed>false</PublishTrimmed>
+    <SatelliteResourceLanguages>zh-Hans</SatelliteResourceLanguages>
     <PackageProjectUrl>https://github.com/xingyungames/agent-safe-gate</PackageProjectUrl>
   </PropertyGroup>
 
@@ -43,6 +52,7 @@
   -->
   <ItemGroup>
     <Content Update="config/secrets.local.json" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
+    <Content Update="secrets.local.json" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
     <Content Update="config/secrets.local.example.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 

@@ -26,19 +26,45 @@ public sealed class AiOptions
     public int AgentTimeoutSeconds { get; set; } = 60;
 }
 
+//报销单 AI 预审配置（只出建议，永不执行）
+public sealed class InvoiceAiOptions
+{
+    public bool Enabled { get; set; } = true;
+
+    //一次 AI 调用打包多少张单
+    public int BatchSize { get; set; } = 20;
+
+    //一次"AI 选单"最多返回多少条
+    public int MaxFindItems { get; set; } = 50;
+
+    //一次批量审批最多多少单
+    public int MaxBatchReview { get; set; } = 50;
+
+    //评分缓存有效期（分钟）
+    public int CacheTtlMinutes { get; set; } = 720;
+
+    //报销审核的独立每日 AI 配额，与 Agent 对话配额分开
+    public int DailyCallsPerUser { get; set; } = 400;
+
+    //空 = 复用 Ai.Model
+    public string Model { get; set; } = "";
+
+    public int TimeoutSeconds { get; set; } = 40;
+}
+
 public sealed class LimitOptions
 {
-    public int LoginPerFiveMinutesPerIp { get; set; } = 6;
+    public int LoginPerFiveMinutesPerIp { get; set; } = 120;
     public int LoginPerFifteenMinutesPerAccount { get; set; } = 5;
     public int AccountLockMinutes { get; set; } = 15;
     public int AgentChatPerFiveMinutesPerUser { get; set; } = 20;
-    public int AgentChatPerFiveMinutesPerIp { get; set; } = 60;
-    public int ReadPerMinutePerUser { get; set; } = 180;
+    public int AgentChatPerFiveMinutesPerIp { get; set; } = 200;
+    public int ReadPerMinutePerUser { get; set; } = 600;
     public int AdminWritePerMinutePerAdmin { get; set; } = 60;
 
-    public int WafStrikesBeforeBan { get; set; } = 8;
-    public int HoneypotStrikesBeforeBan { get; set; } = 3;
-    public int BanMinutes { get; set; } = 60;
+    public int WafStrikesBeforeBan { get; set; } = 60;
+    public int HoneypotStrikesBeforeBan { get; set; } = 50;
+    public int BanMinutes { get; set; } = 10;
 }
 
 public sealed class MailOptions
@@ -72,8 +98,11 @@ public sealed class FeishuOptions
     //飞书 API 基地址
     public string BaseUrl { get; set; } = "https://open.feishu.cn";
 
-    //单次调用超时（毫秒）
-    public int TimeoutMs { get; set; } = 3000;
+    //单次调用超时（毫秒）：报销单读写走这个值，飞书偶发慢时不能再 3 秒就判失败
+    public int TimeoutMs { get; set; } = 30_000;
+
+    //账号镜像的独立短超时（毫秒）：镜像是 best-effort，绝不能拖慢注册/登录
+    public int MirrorTimeoutMs { get; set; } = 3_000;
 
     //失败重试次数
     public int MaxRetries { get; set; } = 1;
@@ -126,6 +155,7 @@ public static class StoreNames
     public const string Versions = "versions.json";
     public const string Outbox = "outbox.json";
     public const string Audit = "audit.jsonl";
+    public const string InvoiceAi = "invoice_ai.json";
     public const string Datasets = "datasets";
     public const string Workspaces = "workspaces";
     public const string Blobs = "blobs";
@@ -144,10 +174,11 @@ public sealed class AppConfig
     public int NonceWindowSeconds { get; set; } = 300;
     public int ClockSkewSeconds { get; set; } = 300;
     public int ApprovalTokenMinutes { get; set; } = 240;
-    public bool AllowSelfRegistration { get; set; } = true;
-    public int SelfRegistrationPerHourPerIp { get; set; } = 3;
     public int MaxRequestBodyBytes { get; set; } = 262144;
     public int MaxUserInputChars { get; set; } = 2000;
+
+    //请求体 WAF 扫描（JSON body 也扫；关掉会让注入特征在 body 里通行）
+    public bool WafScanBody { get; set; } = true;
 
     //口令慢哈希迭代次数
     public int PasswordIterations { get; set; } = Security.Crypto.PasswordIterationsDefault;
@@ -158,11 +189,20 @@ public sealed class AppConfig
     //跨站写请求的 Origin 白名单
     public List<string> TrustedOrigins { get; } = new();
 
+    //IP 白名单：只豁免限流与自动封禁，不豁免认证/签名/权限/规则引擎
+    public List<string> AllowlistIps { get; } = new();
+    public bool AllowlistAuditEveryHit { get; set; } = true;
+
+    //可信代理：只有「TCP 对端就是这些 IP」时，才采信它带来的 X-Client-Ip 头
+    //（用于协作方网关服务端代打的场景：把真实用户 IP 还原出来，限流/锁定/审计才按真实来源算）
+    public List<string> TrustedProxies { get; } = new();
+
     public AiOptions Ai { get; private set; } = new();
     public LimitOptions Limits { get; private set; } = new();
     public MailOptions Mail { get; private set; } = new();
     public FeishuOptions Feishu { get; private set; } = new();
     public BootstrapAdminOptions BootstrapAdmin { get; private set; } = new();
+    public InvoiceAiOptions InvoiceAi { get; private set; } = new();
 
     //飞书凭证是否齐备
     public bool Configured =>
@@ -201,8 +241,7 @@ public sealed class AppConfig
         cfg.NonceWindowSeconds = Int(config["Security:NonceWindowSeconds"], cfg.NonceWindowSeconds);
         cfg.ClockSkewSeconds = Int(config["Security:ClockSkewSeconds"], cfg.ClockSkewSeconds);
         cfg.ApprovalTokenMinutes = Int(config["Security:ApprovalTokenMinutes"], cfg.ApprovalTokenMinutes);
-        cfg.AllowSelfRegistration = Bool(config["Security:AllowSelfRegistration"], cfg.AllowSelfRegistration);
-        cfg.SelfRegistrationPerHourPerIp = Int(config["Security:SelfRegistrationPerHourPerIp"], cfg.SelfRegistrationPerHourPerIp);
+        cfg.WafScanBody = Bool(config["Security:WafScanBody"], cfg.WafScanBody);
         cfg.MaxRequestBodyBytes = Int(config["Security:MaxRequestBodyBytes"], cfg.MaxRequestBodyBytes);
         cfg.MaxUserInputChars = Int(config["Security:MaxUserInputChars"], cfg.MaxUserInputChars);
         cfg.PasswordIterations = Int(Env("AISERVER_PASSWORD_ITERATIONS") ?? config["Security:PasswordIterations"], cfg.PasswordIterations);
@@ -221,6 +260,43 @@ public sealed class AppConfig
                 cfg._warnings.Add($"Security:TrustedOrigins 里的“{item}”不是合法的完整来源（应形如 https://ops.example.com），已忽略。");
         }
         cfg.SecretPepper = Env("AISERVER_PEPPER") ?? config["Security:SecretPepper"] ?? cfg.SecretPepper;
+
+        //IP 白名单：只接受字面 IP，拒绝通配与 CIDR（防误配成后门）
+        cfg.AllowlistAuditEveryHit = Bool(config["Security:AllowlistAuditEveryHit"], true);
+        var allowFromEnv = Env("AISERVER_ALLOWLIST_IPS");
+        var allowRaw = !string.IsNullOrWhiteSpace(allowFromEnv)
+            ? allowFromEnv.Split(new[] { ';', ',', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            : config.GetSection("Security:AllowlistIps").GetChildren().Select(c => c.Value ?? "").Where(v => v.Length > 0);
+        foreach (var item in allowRaw)
+        {
+            var raw = item.Trim();
+            if (raw.Length == 0) continue;
+            if (raw.Contains('*') || raw.Contains('/') || !System.Net.IPAddress.TryParse(raw, out var parsedIp))
+            {
+                cfg._warnings.Add($"Security:AllowlistIps 里的“{raw}”不是可解析的字面 IP（不支持 * 与 CIDR），已忽略。");
+                continue;
+            }
+            var canon = parsedIp.MapToIPv4().ToString();
+            if (!cfg.AllowlistIps.Contains(canon, StringComparer.Ordinal)) cfg.AllowlistIps.Add(canon);
+        }
+
+        //可信代理：同样只接受字面 IP；只有 TCP 对端命中这里，才采信 X-Client-Ip
+        var proxyFromEnv = Env("AISERVER_TRUSTED_PROXIES");
+        var proxyRaw = !string.IsNullOrWhiteSpace(proxyFromEnv)
+            ? proxyFromEnv.Split(new[] { ';', ',', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            : config.GetSection("Security:TrustedProxies").GetChildren().Select(c => c.Value ?? "").Where(v => v.Length > 0);
+        foreach (var item in proxyRaw)
+        {
+            var raw = item.Trim();
+            if (raw.Length == 0) continue;
+            if (raw.Contains('*') || raw.Contains('/') || !System.Net.IPAddress.TryParse(raw, out var proxyIp))
+            {
+                cfg._warnings.Add($"Security:TrustedProxies 里的“{raw}”不是可解析的字面 IP（不支持 * 与 CIDR），已忽略。");
+                continue;
+            }
+            var proxyCanon = proxyIp.MapToIPv4().ToString();
+            if (!cfg.TrustedProxies.Contains(proxyCanon, StringComparer.Ordinal)) cfg.TrustedProxies.Add(proxyCanon);
+        }
 
         //私密配置只读一次，三段共用
         var secrets = ReadSecretsFile(contentRoot, cfg._warnings);
@@ -255,6 +331,18 @@ public sealed class AppConfig
             WafStrikesBeforeBan = Int(config["Limits:WafStrikesBeforeBan"], cfg.Limits.WafStrikesBeforeBan),
             HoneypotStrikesBeforeBan = Int(config["Limits:HoneypotStrikesBeforeBan"], cfg.Limits.HoneypotStrikesBeforeBan),
             BanMinutes = Int(config["Limits:BanMinutes"], cfg.Limits.BanMinutes),
+        };
+
+        cfg.InvoiceAi = new InvoiceAiOptions
+        {
+            Enabled = Bool(Env("AISERVER_INVOICE_AI_ENABLED") ?? config["InvoiceAi:Enabled"], true),
+            BatchSize = Int(config["InvoiceAi:BatchSize"], cfg.InvoiceAi.BatchSize),
+            MaxFindItems = Int(config["InvoiceAi:MaxFindItems"], cfg.InvoiceAi.MaxFindItems),
+            MaxBatchReview = Int(config["InvoiceAi:MaxBatchReview"], cfg.InvoiceAi.MaxBatchReview),
+            CacheTtlMinutes = Int(config["InvoiceAi:CacheTtlMinutes"], cfg.InvoiceAi.CacheTtlMinutes),
+            DailyCallsPerUser = Int(config["InvoiceAi:DailyCallsPerUser"], cfg.InvoiceAi.DailyCallsPerUser),
+            Model = config["InvoiceAi:Model"] ?? cfg.InvoiceAi.Model,
+            TimeoutSeconds = Int(config["InvoiceAi:TimeoutSeconds"], cfg.InvoiceAi.TimeoutSeconds),
         };
 
         cfg.Mail = new MailOptions
@@ -412,6 +500,7 @@ public sealed class AppConfig
         opts.AllowedHosts = config["Feishu:AllowedHosts"] ?? opts.AllowedHosts;
         opts.BaseUrl = (config["Feishu:BaseUrl"] ?? opts.BaseUrl).TrimEnd('/');
         opts.TimeoutMs = Int(config["Feishu:TimeoutMs"], opts.TimeoutMs);
+        opts.MirrorTimeoutMs = Int(config["Feishu:MirrorTimeoutMs"], opts.MirrorTimeoutMs);
         opts.MaxRetries = Int(config["Feishu:MaxRetries"], opts.MaxRetries);
         opts.MirrorPasswordMode = (config["Feishu:MirrorPasswordMode"] ?? opts.MirrorPasswordMode).Trim().ToLowerInvariant();
         opts.DemoPasswordLength = Int(config["Feishu:DemoPasswordLength"], opts.DemoPasswordLength);

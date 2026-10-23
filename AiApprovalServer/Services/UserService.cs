@@ -193,56 +193,46 @@ public sealed class UserService
     }
 
     //登录判断
+    //时序：账号不存在 / 已禁用 / 口令错误 三条路径都只跑一次等价的 PBKDF2，响应时间不可区分
+    //锁定：不再按账号全局锁定（会被用来低成本打掉他人账号），改由 AuthApi 按 (来源IP + 账号) 组合锁定
     public async Task<LoginResult> LoginAsync(string userName, string password, string ip)
     {
         var user = await FindByNameAsync(userName).ConfigureAwait(false);
-        var now = DateTime.UtcNow;
 
+        var ok = false;
         if (user is null)
         {
-            //账号不存在也走同样的慢哈希
+            //付一次等价代价后返回，避免"用户不存在更快"被枚举
             Crypto.VerifyPassword(password, "", Convert.ToBase64String(new byte[16]), _cfg.PasswordIterations,
                 Crypto.PasswordSchemeCurrent, _passwordPepper, dummy: true);
-            return new LoginResult { Success = false, Error = "用户名或口令错误", AccountNotFound = true };
         }
+        else
+        {
+            ok = Crypto.VerifyPassword(password, user.PasswordHash, user.PasswordSalt, user.PasswordIterations,
+                user.PasswordScheme, _passwordPepper);
+        }
+
+        if (user is null)
+            return new LoginResult { Success = false, Error = "用户名或口令错误", AccountNotFound = true };
 
         if (user.Disabled)
             return new LoginResult { Success = false, Error = "该账号已被禁用，请联系管理员" };
 
-        if (user.IsLocked)
-            return new LoginResult { Success = false, Locked = true, LockedUntil = user.LockedUntil, Error = "账号因多次登录失败被临时锁定" };
-
-        var ok = Crypto.VerifyPassword(password, user.PasswordHash, user.PasswordSalt, user.PasswordIterations,
-            user.PasswordScheme, _passwordPepper);
         if (!ok)
         {
-            var updated = await _store.MutateAsync<UserRecord, (int Fails, DateTime? Locked)>(StoreNames.Users, list =>
+            //账号维度只留计数供审计，不再据此锁定
+            var fails = await _store.MutateAsync<UserRecord, int>(StoreNames.Users, list =>
             {
                 var target = list.FirstOrDefault(u => u.Id == user.Id);
-                if (target is null) return (0, null);
-
+                if (target is null) return 0;
                 target.FailedLoginCount++;
-                if (target.FailedLoginCount >= _cfg.Limits.LoginPerFifteenMinutesPerAccount)
-                {
-                    target.LockedUntil = DateTime.UtcNow.AddMinutes(_cfg.Limits.AccountLockMinutes);
-                    target.FailedLoginCount = 0;
-                    return (0, target.LockedUntil);
-                }
-                return (target.FailedLoginCount, null);
+                return target.FailedLoginCount;
             }).ConfigureAwait(false);
 
             await _audit.WriteAsync(user.Id, user.UserName, user.Role, ip, "auth.login", user.UserName,
-                "FAIL", $"口令错误，累计失败 {updated.Fails} 次{(updated.Locked is null ? "" : "，账号已锁定")}").ConfigureAwait(false);
+                "FAIL", $"口令错误，账号累计失败 {fails} 次").ConfigureAwait(false);
 
-            return new LoginResult
-            {
-                Success = false,
-                Locked = updated.Locked is not null,
-                LockedUntil = updated.Locked,
-                Error = updated.Locked is not null
-                    ? $"多次登录失败，账号已锁定至 {updated.Locked:HH:mm:ss}"
-                    : "用户名或口令错误",
-            };
+            return new LoginResult { Success = false, Error = "用户名或口令错误" };
         }
 
         //旧口令方案就地升级
@@ -688,9 +678,30 @@ public sealed class UserService
         }).ConfigureAwait(false);
     }
 
-    //解密邮箱
-    public string DecryptEmail(UserRecord user)
+    //报销单 AI 预审的独立每日配额（与对话配额分开，互不挤占）
+    public async Task<(bool Allowed, int Used)> TryConsumeInvoiceAiQuotaAsync(string userId)
     {
+        var today = DateTime.UtcNow.ToString("yyyy-MM-dd");
+        return await _store.MutateAsync<UserRecord, (bool, int)>(StoreNames.Users, list =>
+        {
+            var target = list.FirstOrDefault(u => u.Id == userId);
+            if (target is null) return (false, 0);
+
+            if (!string.Equals(target.InvoiceAiQuotaDate, today, StringComparison.Ordinal))
+            {
+                target.InvoiceAiQuotaDate = today;
+                target.InvoiceAiCallsToday = 0;
+            }
+
+            if (target.InvoiceAiCallsToday >= _cfg.InvoiceAi.DailyCallsPerUser) return (false, target.InvoiceAiCallsToday);
+
+            target.InvoiceAiCallsToday++;
+            return (true, target.InvoiceAiCallsToday);
+        }).ConfigureAwait(false);
+    }
+
+    //解密邮箱
+    public string DecryptEmail(UserRecord user)    {
         if (string.IsNullOrEmpty(user.EmailCipher)) return "";
         return Crypto.AesGcmDecrypt(user.EmailCipher, _emailKey, Aad(user.Id)) ?? "";
     }

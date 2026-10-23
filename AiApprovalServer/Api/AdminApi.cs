@@ -687,12 +687,112 @@ public static class AdminApi
 
             return ok ? Api.Ok(new { message = $"已解封 {ip}" }) : Api.Error(404, "NOT_FOUND", "该 IP 不在封禁列表中");
         });
+
+        //报销单 AI 预审：管理台只读建议，没有任何执行端点
+        group.MapGet("/invoice-ai/scores", async (HttpContext context, InvoiceService invoices, InvoiceAiService ai,
+            bool? refresh) =>
+        {
+            var identity = Api.Identity(context);
+            if (identity is null) return Api.Error(401, "UNAUTHENTICATED", "请先登录");
+            if (!Roles.IsAdminSide(identity.User.Role))
+                return Api.Error(403, "FORBIDDEN", "只有管理员可以查看 AI 预审建议");
+            if (!ai.Enabled) return Api.Error(400, "AI_DISABLED", "报销 AI 预审未启用");
+
+            var (ok, error, rows) = await invoices.ListAsync(identity, 500);
+            if (!ok) return Api.Error(502, "FEISHU_UNAVAILABLE", error);
+
+            InvoiceAiOutcome? outcome = null;
+            Dictionary<string, InvoiceAiScore> index;
+            if (refresh == true)
+            {
+                outcome = await ai.ScoreAsync(identity, rows, true, context.RequestAborted);
+                index = outcome.Scores
+                    .GroupBy(s => s.RecordId, StringComparer.Ordinal)
+                    .ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
+            }
+            else
+            {
+                index = await ai.ScoreIndexAsync(rows, context.RequestAborted);
+            }
+
+            var list = rows
+                .Select(r => new
+                {
+                    recordId = r.RecordId,
+                    billNo = r.Text(InvoicePolicy.FieldBillNo),
+                    applicant = r.Text(InvoicePolicy.FieldApplicant),
+                    employeeId = r.Text(InvoicePolicy.FieldEmployeeId),
+                    rtype = r.Text(InvoicePolicy.FieldType),
+                    amount = r.Amount,
+                    city = r.Text(InvoicePolicy.FieldCity),
+                    hasInvoice = r.Text(InvoicePolicy.FieldInvoiceState),
+                    reason = r.Text(InvoicePolicy.FieldReason),
+                    status = r.Text(InvoicePolicy.FieldStatus),
+                    hasScore = index.ContainsKey(r.RecordId),
+                    finalLevel = index.TryGetValue(r.RecordId, out var s) ? s.FinalLevel : 0,
+                    levelLabel = index.TryGetValue(r.RecordId, out var s2) ? InvoiceAiLevel.Label(s2.FinalLevel) : "未评分",
+                    ruleSummary = index.TryGetValue(r.RecordId, out var s3) ? s3.RuleSummary : "",
+                    aiReason = index.TryGetValue(r.RecordId, out var s4) ? s4.AiReason : "",
+                })
+                .ToList();
+
+            return Api.Ok(new
+            {
+                note = "管理台仅展示 AI 建议；本系统不存在由 AI 触发审批或执行的接口，审批必须由人或财务在各自界面点击",
+                aiAvailable = outcome?.AiAvailable ?? true,
+                aiError = outcome?.AiError ?? "",
+                scoredCount = index.Count,
+                total = list.Count,
+                rows = list,
+            });
+        });
+
+        //AI 按需求选单（管理台只读，同样不执行）
+        group.MapGet("/invoice-ai/find", async (HttpContext context, InvoiceService invoices, InvoiceAiService ai,
+            string? q) =>
+        {
+            var identity = Api.Identity(context);
+            if (identity is null) return Api.Error(401, "UNAUTHENTICATED", "请先登录");
+            if (!Roles.IsAdminSide(identity.User.Role))
+                return Api.Error(403, "FORBIDDEN", "只有管理员可以使用 AI 选单建议");
+
+            var requirement = Api.Clean(q, 200);
+            if (requirement.Length < 2) return Api.Error(400, "BAD_REQUEST", "请提供 q（需求描述，不少于 2 个字符）");
+
+            var (ok, error, rows) = await invoices.ListAsync(identity, 500);
+            if (!ok) return Api.Error(502, "FEISHU_UNAVAILABLE", error);
+
+            var index = await ai.ScoreIndexAsync(rows, context.RequestAborted);
+            var outcome = await ai.FindAsync(identity, rows, index, requirement, context.RequestAborted);
+            if (!outcome.Ok) return Api.Error(400, "AI_FIND_FAILED", outcome.Error);
+
+            return Api.Ok(new
+            {
+                action = outcome.Action,
+                note = outcome.Note,
+                message = "仅为 AI 建议清单；管理台不提供批量审批接口，请到待审批任务里逐个由人处理",
+                picked = outcome.Picked.Select(p => new
+                {
+                    recordId = p.RecordId,
+                    billNo = p.BillNo,
+                    summary = p.Summary,
+                    reason = p.Reason,
+                    level = p.Level,
+                    levelLabel = p.Level > 0 ? InvoiceAiLevel.Label(p.Level) : "",
+                    status = p.Status,
+                    applicant = p.Applicant,
+                    amount = p.Amount,
+                    rtype = p.Type,
+                }).ToList(),
+                dropped = outcome.Dropped.Select(d => new { recordId = d.RecordId, droppedReason = d.DroppedReason }).ToList(),
+            });
+        });
     }
 
     private static bool AdminWriteAllowed(SecurityGuard guard, RequestIdentity identity, out string message)
     {
         message = "";
-        if (guard.TryConsume($"adminwrite:{identity.User.Id}", guard.AdminWritePerMinute, TimeSpan.FromMinutes(1))) return true;
+        if (guard.TryConsume($"adminwrite:{identity.User.Id}", guard.AdminWritePerMinute, TimeSpan.FromMinutes(1), identity.Ip)) return true;
         message = "管理操作过于频繁，请稍后再试";
         return false;
     }

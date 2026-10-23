@@ -11,24 +11,11 @@ public static class AuthApi
 {
     public static void Map(WebApplication app)
     {
-        app.MapGet("/api/public/health", (AppConfig cfg, AiClient ai) => Api.Ok(new
+        //公开存活探针：只回最少的两个字段，不泄露模型、AI 状态、配置开关等指纹信息
+        app.MapGet("/api/public/health", () => Api.Ok(new
         {
             status = "ok",
             serverTime = DateTime.UtcNow,
-            aiConfigured = ai.IsConfigured,
-            aiModel = ai.IsConfigured ? ai.Model : null,
-            //只有最近调用成功才算 online
-            aiStatus = ai.Status,
-            aiLastSuccessAt = ai.LastSuccessAt,
-            aiLastFailureAt = ai.LastFailureAt,
-            aiLastError = ai.IsConfigured ? ai.LastError : "",
-            mode = ai.Status switch
-            {
-                "online" => "AI 意图解析 + AI 安全审核（物理隔离）",
-                "degraded" => "AI 已配置但调用失败 → 已降级为本地意图解析，变更类操作全部转人工审批",
-                _ => "本地意图解析（AI 未配置）+ 审核不可用 → 变更类操作全部转人工审批",
-            },
-            selfRegistration = cfg.AllowSelfRegistration,
         }));
 
         app.MapPost("/api/auth/login", LoginAsync);
@@ -44,7 +31,7 @@ public static class AuthApi
             return Api.Ok(new { message = "已退出登录" });
         });
 
-        app.MapGet("/api/auth/me", (HttpContext context) =>
+        app.MapGet("/api/auth/me", (HttpContext context, AiClient ai) =>
         {
             var identity = Api.Identity(context);
             if (identity is null) return Api.Error(401, "UNAUTHENTICATED", "请先登录");
@@ -60,6 +47,9 @@ public static class AuthApi
                 emailMasked = identity.User.EmailMasked,
                 permissions = PermissionList(identity.User.Role),
                 lastLoginAt = identity.User.LastLoginAt,
+                //AI 状态只对已登录用户可见（公开探针不再泄露）
+                aiConfigured = ai.IsConfigured,
+                aiStatus = ai.Status,
             });
         });
 
@@ -68,7 +58,7 @@ public static class AuthApi
             var identity = Api.Identity(context);
             if (identity is null) return Api.Error(401, "UNAUTHENTICATED", "请先登录");
 
-            if (!guard.TryConsume($"password:{identity.User.Id}", 5, TimeSpan.FromMinutes(15)))
+            if (!guard.TryConsume($"password:{identity.User.Id}", 5, TimeSpan.FromMinutes(15), identity.Ip))
                 return Api.Error(429, "RATE_LIMITED", "修改口令过于频繁，请稍后再试");
 
             var body = Api.ReadBody<ChangePasswordRequest>(context);
@@ -101,7 +91,7 @@ public static class AuthApi
         if (guard.IsBanned(ip, out _, out _))
             return Api.Error(403, "IP_BANNED", "请求被安全策略拒绝");
 
-        if (!guard.TryConsume($"login:ip:{ip}", cfg.Limits.LoginPerFiveMinutesPerIp, TimeSpan.FromMinutes(5)))
+        if (!guard.TryConsume($"login:ip:{ip}", cfg.Limits.LoginPerFiveMinutesPerIp, TimeSpan.FromMinutes(5), ip))
         {
             guard.Strike(ip, "登录接口请求过频", weight: 1, loginFail: true);
             await audit.WriteAsync("", "", "", ip, "auth.rate-limit", "login", "BLOCKED", "登录频率超限");
@@ -116,19 +106,39 @@ public static class AuthApi
         if (userName.Length == 0 || password.Length is 0 or > 128)
             return Api.Error(400, "BAD_REQUEST", "请输入用户名与口令");
 
+        //锁定按 (来源 IP + 账号) 组合：攻击者只能锁死自己这条通道，锁不掉他人的账号
+        if (guard.IsLoginLocked(ip, userName, out var lockedUntil))
+        {
+            await audit.WriteAsync("", userName, "", ip, "auth.lockout", userName, "BLOCKED",
+                $"该来源对账号 {userName} 连续失败过多，锁定至 {lockedUntil:HH:mm:ss}（UTC）");
+            return Api.Error(401, "AUTH_LOCKED",
+                $"该来源对该账号连续登录失败过多，请于 {lockedUntil:HH:mm:ss}（UTC）后再试");
+        }
+
         var result = await users.LoginAsync(userName, password, ip);
 
         if (!result.Success)
         {
             guard.Strike(ip, $"登录失败（{Api.Clean(userName, 32)}）", weight: 1, loginFail: true);
 
-            if (result.Locked)
-                await audit.WriteAsync("", userName, "", ip, "auth.lockout", userName, "LOCKED",
-                    $"连续失败触发账号锁定至 {result.LockedUntil:HH:mm:ss}（UTC）");
+            var locked = guard.RecordLoginFailure(ip, userName,
+                cfg.Limits.LoginPerFifteenMinutesPerAccount, TimeSpan.FromMinutes(15),
+                TimeSpan.FromMinutes(cfg.Limits.AccountLockMinutes), out var lockUntil);
 
-            await Task.Delay(result.AccountNotFound ? 120 : 60);
-            return Api.Error(401, "AUTH_FAILED", result.Error);
+            if (locked)
+                await audit.WriteAsync("", userName, "", ip, "auth.lockout", userName, "LOCKED",
+                    $"该来源对账号 {userName} 连续失败达到阈值，锁定至 {lockUntil:HH:mm:ss}（UTC）");
+
+            //固定延迟：账号不存在与口令错误耗时一致（慢哈希本身已等价，这里只抹掉网络抖动）
+            await Task.Delay(60);
+
+            return Api.Error(401, "AUTH_FAILED",
+                locked
+                    ? $"连续登录失败过多，请于 {lockUntil:HH:mm:ss}（UTC）后再试"
+                    : "用户名或口令错误");
         }
+
+        guard.ClearLoginFailure(ip, userName);
 
         var user = result.User!;
         var token = jwt.Issue(user.Id, user.UserName, user.Role, user.TokenEpoch, out var signKey, out var expiresAt);
@@ -171,7 +181,7 @@ public static class AuthApi
         var identity = Api.Identity(context);
         if (identity is null) return Api.Error(401, "UNAUTHENTICATED", "请先登录后再创建账号");
 
-        if (!guard.TryConsume($"register:user:{identity.User.Id}", 20, TimeSpan.FromHours(1)))
+        if (!guard.TryConsume($"register:user:{identity.User.Id}", 20, TimeSpan.FromHours(1), ip))
         {
             guard.Strike(ip, "创建账号过频", weight: 1, waf: true);
             return Api.Error(429, "RATE_LIMITED", "创建账号过于频繁");

@@ -181,9 +181,13 @@ public sealed class UserRecord
     public DateTime? LastLoginAt { get; set; }
     public string LastLoginIp { get; set; } = "";
 
-    //AI 每日调用配额
+    //AI 每日调用配额（Agent 对话）
     public string AiQuotaDate { get; set; } = "";
     public int AiCallsToday { get; set; }
+
+    //报销单 AI 预审的独立每日配额（与对话配额分开，旧文件缺字段取默认 0）
+    public string InvoiceAiQuotaDate { get; set; } = "";
+    public int InvoiceAiCallsToday { get; set; }
 
     //令牌世代，+1 使旧令牌失效
     public int TokenEpoch { get; set; }

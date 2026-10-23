@@ -24,6 +24,7 @@ public sealed class SecurityMiddleware
 {
     public const string IdentityKey = "ai_identity";
     public const string RawBodyKey = "ai_raw_body";
+    public const string AllowlistedKey = "ai_allowlisted_ip";
 
     private static readonly HashSet<string> PublicApi = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -54,10 +55,21 @@ public sealed class SecurityMiddleware
 
     public async Task InvokeAsync(HttpContext context)
     {
-        var ip = SecurityGuard.ClientIp(context);
+        //最前面解析一次真实来源 IP：可信代理带来的 X-Client-Ip 会被采信，后续限流/封禁/锁定/审计统一用它
+        var ip = SecurityGuard.ResolveClientIp(context, _cfg.TrustedProxies);
+        context.Items[SecurityGuard.ClientIpKey] = ip;
         AddSecurityHeaders(context);
 
         var path = context.Request.Path.Value ?? "/";
+
+        //白名单来源：只豁免限流与自动封禁，认证/签名/权限/规则引擎照常校验
+        if (_guard.IsAllowlisted(ip))
+        {
+            context.Items[AllowlistedKey] = true;
+            if (_cfg.AllowlistAuditEveryHit && _guard.TryConsume($"allowlist:{ip}", 60, TimeSpan.FromMinutes(1)))
+                await _audit.WriteAsync("", "", "", ip, "security.allowlist", Truncate(path, 120), "ALLOWLISTED",
+                    "白名单来源请求：已豁免限流与自动封禁（认证、签名、权限、规则引擎仍正常校验）").ConfigureAwait(false);
+        }
 
         if (_guard.IsBanned(ip, out var bannedUntil, out var banReason))
         {
@@ -98,6 +110,20 @@ public sealed class SecurityMiddleware
         try
         {
             var body = await BufferBodyAsync(context).ConfigureAwait(false);
+
+            //请求体 WAF：JSON body 同样要扫，否则注入特征只藏在 body 里就能绕过
+            if (_cfg.WafScanBody && body is { Length: > 0 })
+            {
+                var bodyHit = WafPatterns.ScanBody(Encoding.UTF8.GetString(body));
+                if (bodyHit is not null)
+                {
+                    var bannedBody = _guard.Strike(ip, $"WAF 命中请求体 {bodyHit}", weight: 2, waf: true);
+                    await _audit.WriteAsync("", "", "", ip, "waf.body", Truncate(path, 200),
+                        bannedBody ? "BANNED" : "BLOCKED", $"请求体命中特征：{bodyHit}").ConfigureAwait(false);
+                    await WriteJsonAsync(context, 400, new { error = "请求内容包含非法特征", code = "WAF_BLOCKED" }).ConfigureAwait(false);
+                    return;
+                }
+            }
 
             if (IsStateChanging(context) && !IsSameOrigin(context))
             {

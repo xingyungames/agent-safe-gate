@@ -46,28 +46,24 @@ public static class Crypto
         return (Convert.ToBase64String(hash), Convert.ToBase64String(salt), iterations, PasswordSchemeCurrent);
     }
 
-    //恒定时间校验口令，dummy 防枚举
+    //恒定时间校验口令；dummy=true 时付出与正常校验完全等价的代价后返回 false
+    //（账号不存在 / 已禁用 / 已锁定 都走这里，消除"响应时间差可枚举账号"的侧信道）
     public static bool VerifyPassword(string password, string hashB64, string saltB64, int iterations,
         string scheme, byte[] pepperKey, bool dummy = false)
     {
         if (iterations <= 0) iterations = PasswordIterationsDefault;
 
-        byte[] expected;
-        try
-        {
-            expected = dummy
-                ? Pbkdf2(Pepper(pepperKey, "dummy-password-for-timing"), Convert.FromBase64String(saltB64), iterations)
-                : Convert.FromBase64String(hashB64);
-        }
-        catch
-        {
-            return false;
-        }
-
+        //恒定一次 PBKDF2：不因账号状态而多算或少算
         var material = UsesPepper(scheme) ? Pepper(pepperKey, password) : Encoding.UTF8.GetBytes(password);
         var actual = Pbkdf2(material, TrySalt(saltB64), iterations);
-        var equal = CryptographicOperations.FixedTimeEquals(expected, actual);
-        return !dummy && equal;
+
+        if (dummy) return false;
+
+        byte[] expected;
+        try { expected = Convert.FromBase64String(hashB64); }
+        catch { return false; }
+
+        return CryptographicOperations.FixedTimeEquals(expected, actual);
     }
 
     //该方案是否用服务端密钥

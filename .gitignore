@@ -62,16 +62,26 @@ secrets.json
 # ---------------------------------------------------------------
 config/secrets.local.json
 **/config/secrets.local.json
+secrets.local.json
+**/secrets.local.json
 !**/config/secrets.local.example.json
+!**/secrets.local.example.json
 .env
 .env.*
 !.env.example
 **/.env
 **/.env.*
 !**/.env.example
+# 变体命名（如 xiaocainu.env）：里面同样放着模型密钥与飞书凭证
+*.env
+**/*.env
+!*.env.example
+!**/*.env.example
 appsettings.Local.json
 appsettings.*.Local.json
 appsettings.Development.json
+# 本地发布产物（体积大且可重新生成）
+dist/
 *.key
 *.pem
 *.pfx
@@ -89,6 +99,10 @@ appsettings.Development.json
 目前实际接入.md
 /TABLE_SETUP.md
 /飞书字段对接手册.md
+
+# 协作方单独发来的整包（内含他本机的 .env 与独立 .git 历史，绝不入库）
+/xiaocainu2/
+/xiaocainu-*/
 
 # ---------------------------------------------------------------
 # 临时与调试残留

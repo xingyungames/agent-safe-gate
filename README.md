@@ -5,12 +5,12 @@
 
 系统由两个独立服务组成，职责严格切开：
 
-| 侧 | 目录 | 技术栈 | 作者 | 一句话职责 |
+| 侧 | 目录 | 技术栈 | 作者 |
 | --- | --- | --- | --- | --- |
-| **表现层** | `xiaocainu/` | Python 3 + FastAPI | **小新** | 对话交互、意图理解、发票 OCR、把自然语言整理成字段并回显 |
-| **校验层 / 权威层** | `AiApprovalServer/` | C# .NET 8 | **星涵** | 账号权限、报销单唯一写入口、枚举与金额硬校验、服务端盖章、审批与回退、审计哈希链、WAF 与限流 |
+| **表现层** | `xiaocainu/` | Python 3 + FastAPI | **小新** |
+| **校验层** | `AiApprovalServer/` | C# .NET 8 | **星涵** |
 
-**边界就一句话：AI 层可以随便理解，落地必须过校验层；校验层拒绝的，AI 层不许绕过。**
+**边界一句话：AI 层可以随便理解，落地必须过校验层；校验层拒绝的，AI 层不许绕过**
 
 ---
 
@@ -51,34 +51,40 @@
 
 ---
 
-## 2. 作者与分工
+## 2. 作者
 
-| 侧 | 作者 | 负责 | 不负责 |
-| --- | --- | --- | --- |
-| **C# 侧** | **星涵** | 账号权威、权限矩阵、报销单唯一写入口、校验与盖章、审批状态机、快照与回退、审计哈希链、WAF/蜜罐/限流/签名防重放、三个自带页面（业务台 / 财务台 / 管理后台） | 对话界面、AI 意图理解、发票 OCR |
-| **Python 侧** | **小新** | 对话交互、自然语言 → 结构化字段、多轮追问、发票 OCR、结果回显 | 账号判定、权限判定、报销单写入（一律委托 C# 侧） |
-
-> 账号库、角色、权限**只在 C# 侧**（`App_Data/users.json`）。Python 侧**没有任何账号库**，登录判定也打到 C# 侧。
+**星涵**：https://github.com/xingyungames
+**小新**：https://github.com/2154510576-bxd
 
 ---
 
 ## 3. 全景链路：一次报销怎么走完
 
-```
-┌──────────┐   ①登录   ┌─────────────────────┐   ②委托登录   ┌──────────────────────────┐
-│  浏览器  │ ────────► │  Python 网关 :8000  │ ────────────► │  C# 主服务器 :6616        │
-│          │ ◄──────── │  (xiaocainu/FastAPI)│ ◄──────────── │  (AiApprovalServer)      │
-└──────────┘  token    └─────────────────────┘  token+signKey └───────────┬──────────────┘
-     │                        │                                          │
-     │ ③对话"打车38块"         │ ④AI 抽字段 + OCR                          │ ⑤校验+盖章
-     │ ─────────────────────► │ ─────────────────────────────────────────►│
-     │                        │                                          │ ⑥唯一写入口
-     │ ⑦回显单号与状态          │ ◄───────────────────────────────────────── │
-     │ ◄───────────────────── │                                          ▼
-     │                        │                                  ┌───────────────┐
-     └── 财务在 C# /finance 页审核 ──────────────────────────────►│ 飞书多维表格  │
-                                                                  │ 报销单主表    │
-                                                                  └───────────────┘
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as "员工/浏览器"
+    participant Py as "Python 网关 (:8000)"
+    participant CSharp as "C-Sharp 主服务器 (:6616)"
+    participant Feishu as "飞书多维表格"
+
+    User->>Py: 1. 发起登录
+    Py->>CSharp: 2. 委托登录校验 (POST /api/auth/login)
+    CSharp->>CSharp: 校验口令、签发 JWT + signKey、写审计
+    CSharp-->>Py: 返回 token + signKey
+    Py-->>User: 返回登录 token (存 sessionStorage)
+
+    User->>Py: 3. 发起对话：“打车38块”
+    Py->>Py: 4. AI 解析意图、抽字段、发票图 OCR
+    Py->>CSharp: 5. 提交结构化报销单 (带请求签名)
+    CSharp->>CSharp: 校验合法性、服务端盖章、写审计
+    CSharp->>CSharp: 6. 唯一写入口处理（写前快照、写后版本）
+    CSharp->>Feishu: 写入报销单主表
+    CSharp-->>Py: 7. 返回单号与状态
+    Py-->>User: 回显单号与状态
+    
+    Note over User,Feishu: 财务在 C-Sharp 的 /finance 页审核 / 修改 / 删除
+    Note over User,Feishu: 管理员在 /admin 页按日志回退
 ```
 
 | 步 | 谁做 | 发生什么 |
@@ -110,7 +116,7 @@ X-Signature: Base64(HMAC-SHA256(signKey, "METHOD\nPATH?QUERY\nTS\nNONCE\nSHA256_
 
 - **ASP.NET Core 8 最小 API**，单进程、开箱即跑
 - **零第三方 NuGet 依赖**：JWT（自实现 HS256 紧凑序列化）、PBKDF2-HMAC-SHA256、AES-256-GCM、`System.Text.Json` 全部来自 BCL —— 依赖越少，可审计面越小
-- **JSON 文件即数据库**：原子写（临时文件 + 替换）+ `.bak` 备份 + 独占文件锁
+- **JSON 文件即数据库**：原子写（临时文件 + 替换）+ `.bak` 备份 + 独占文件锁 比赛并非数据库安全和算法大赛，json数据库相比之下更好维护
 - **前端零依赖**：原生 JS + `textContent`，不用 `innerHTML`/`eval`，严格 CSP
 - 发票数据存**飞书多维表格**（本系统不持有独立的业务数据库）
 
@@ -138,7 +144,7 @@ AiApprovalServer/
 4. **审批与可回退**：写前整行快照、写后 Diff + 版本记录，管理员可按日志一键回退（含"删除→重建"）。
 5. **可审计**：所有关键节点进 JSONL 哈希链，管理后台可一键校验整链并定位首个断链。
 
-### 4.4 AI 在本侧怎么用（**全部只出建议，没有执行权**）
+### 4.4 AI 在本侧怎么用
 
 | 用途 | 接口 | 说明 |
 | --- | --- | --- |
@@ -433,7 +439,7 @@ FEISHU_TABLE_ID=tblxxx
 ```bash
 # 上传发布目录到 /opt
 cd /opt/AiApprovalServer-linux
-chmod +x AiApprovalServer          # Linux 需可执行位（服务脚本同理）
+chmod +x AiApprovalServer          # Linux 需可执行位
 AISERVER_LISTEN_URL=http://0.0.0.0:6616 ./AiApprovalServer
 # → 监听 0.0.0.0:6616，可用 API 与三个页面
 ```
@@ -524,7 +530,8 @@ cd xiaocainu && python -m pytest tests -q
 
 [MIT](LICENSE) © 2026 星云游
 
-| 侧 | 作者 |
-| --- | --- |
-| C# 侧（`AiApprovalServer/`） | **星涵** |
-| Python 侧（`xiaocainu/`） | **小新** |
+
+
+作者
+C# 侧（`AiApprovalServer/`） **星涵** ：个人名片 http://xingyungames.cn/xinghan.html
+Python 侧（`xiaocainu/`） **小新** 

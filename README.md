@@ -53,8 +53,8 @@
 
 ## 2. 作者
 
-**星涵**：https://github.com/xingyungames
-**小新**：https://github.com/2154510576-bxd
+**星涵**：https://github.com/xingyungames  
+**小新**：https://github.com/2154510576-bxd  
 
 ---
 
@@ -533,5 +533,6 @@ cd xiaocainu && python -m pytest tests -q
 
 
 作者
-C# 侧（`AiApprovalServer/`） **星涵** ：个人名片 http://xingyungames.cn/xinghan.html
-Python 侧（`xiaocainu/`） **小新** 
+C# 侧（`AiApprovalServer/`） **星涵**   
+个人名片 http://xingyungames.cn/xinghan.html  
+Python 侧（`xiaocainu/`） **小新**   

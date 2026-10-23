@@ -6,6 +6,31 @@
 
 ## [未发布]
 
+### 新增：Linux 免安装包（自包含发布）与页面不缓存
+
+- **自包含发布**：新增 `dotnet publish -r linux-x64 --self-contained true` 交付方式，目标机不需安装 .NET；
+  发布约定锁死 `PublishSingleFile=false` / `PublishTrimmed=false`，保证 `wwwroot/` 与 `appsettings.json` 都是
+  可随时编辑的松散文件（改 html 刷新即生效，改 json 重启生效）。
+- **修掉一处意外的密钥外泄**：Web SDK 默认把项目根下的 `*.json` 当 Content 复制进 bin/publish，
+  根目录残留的 `secrets.local.json` 副本会跟着被打进发布包。现在 `config/secrets.local.json` 与
+  `secrets.local.json` 一律 `CopyToOutputDirectory=Never`，源码树里根级重复文件已删除，
+  `.gitignore` 增加 `**/secrets.local.json`。
+- **页面入口补 `Cache-Control: no-store`**：`/`、`/index.html`、`/admin`、`/finance` 由
+  `Results.File` 直接返回，原先没有缓存头，浏览器可能缓存旧页面，与"改完 html 刷新即生效"的承诺冲突。
+- **`.gitignore` 补 `*.env` / `**/*.env` / `dist/`**：`xiaocainu.env` 这类变体命名的文件里放着模型密钥与飞书凭证，
+  之前不在忽略范围内。
+
+### 修复：回退「审核/修改」版本时金额以字符串写回飞书被拒
+
+- **现象**：管理后台「版本与回退」对「审核/修改」类版本点「按日志回退」，飞书返回 `code=1254001 WrongRequestBody`
+  （错误原文：`the value of 'Currency' must be a number`），回退失败；「删除→重建」路径同样会在金额上被拒。
+- **原因**：真实表「金额」是 Currency（数字）列，但飞书记录接口读出来是**字符串**（`"2000"`）；版本快照按 JSON 文本保存，
+  上一轮修复只按"去引号 + 日期转毫秒"还原，金额仍以字符串写回，数字列不接受。离线 e2e 用的假飞书不校验字段类型，所以一直全绿。
+- **修复**：快照还原层统一按字段类型归一——`金额` 字符串转数字、`发票日期`/`记录提交时间`/`审批时间` 转毫秒数字；
+  `RollbackAsync`（审核/修改回退）与 `ReadSnapshotFields`（删除→重建）两条路径共用。
+- **回归用例**：假飞书增加字段类型校验（`金额` 非数字 → `1254001`，日期列非数字 → `1254064`），与真实飞书行为一致；
+  `e2e-invoice.mjs` 增加"重建后金额是数字类型"断言，该套件由 51 项增至 52 项。
+
 ### 修复：管理后台「按日志回退」写回飞书时字段类型错误
 
 - **现象**：在管理后台对一条「审核」记录点「按日志回退」，报表里出现飞书错误 `code=1254064 DatetimeFieldConvFail`（日期字段转换失败）

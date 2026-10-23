@@ -163,11 +163,16 @@
 | `invoice.update` | `InvoiceService` | 财务修改报销单字段 |
 | `invoice.delete` | `InvoiceService` | 删除报销单 |
 | `invoice.rollback` | `InvoiceService` | 按版本日志回退报销单（`SUCCESS` / `SKIPPED` 幂等跳过 / `FAILED`） |
+| `invoice.ai.score` | `InvoiceAiService` | AI 预审打分（`SUCCESS` / `PARTIAL`），详情含单量、跳过数、失败批次、注入标记 |
+| `invoice.ai.find` | `InvoiceAiService` | AI 按需求选单（`SUGGESTED`，只记建议，不代表执行） |
+| `invoice.batch` | `InvoiceService` | 批量审核（`SUCCESS` / `PARTIAL`），逐单另有 `invoice.review` |
+| `security.allowlist` | 安全中间件 | 白名单 IP 请求放行（可在 `Security:AllowlistAuditEveryHit=false` 关闭） |
 | `admin.rollback` | `AdminApi` | 文件/数据集类版本回退（报销单请用 `invoice.rollback`） |
 | `admin.unban` | `AdminApi` | 管理员手动解封 IP |
 | `admin.activity-summary` / `admin.task-list` | `Harness` | 管理端 AI 助手的聚合查询 |
 | `security.blocked` | 安全中间件 | 被封禁 IP 的请求被拒 |
-| `waf.block` | 安全中间件 | WAF 命中 |
+| `waf.block` | 安全中间件 | WAF 命中（路径 / 查询串 / 请求头） |
+| `waf.body` | 安全中间件 | WAF 命中**请求体**（JSON body，见 2.6 节；由 `Security:WafScanBody` 控制） |
 | `csrf.block` | 安全中间件 | 跨站来源被拒 |
 | `honeypot.probe` / `honeypot.credential` | 安全中间件 | 蜜罐探测 / 向诱饵后台提交凭据 |
 | `recon.robots` | 安全中间件 | 读取 `robots.txt` |
@@ -367,24 +372,55 @@ HTTP 403 { "error": "请求来源不被信任", "code": "BAD_ORIGIN" }
 
 ### 2.6 限流与自动封禁
 
-固定窗口计数（内存态，进程重启清零；账号锁定则持久化在 `users.json`）。
+固定窗口计数与登录失败锁定都在**进程内存**（重启即清零）。
 
 | 场景 | 计数键 | 默认阈值 | 配置项 | 超限响应 |
 | --- | --- | --- | --- | --- |
-| 登录 | `login:ip:{ip}` | 6 次 / 5 分钟 | `Limits:LoginPerFiveMinutesPerIp` | 429 `RATE_LIMITED` + 审计 `auth.rate-limit` |
+| 登录 | `login:ip:{ip}` | 120 次 / 5 分钟 | `Limits:LoginPerFiveMinutesPerIp` | 429 `RATE_LIMITED` + 审计 `auth.rate-limit` |
 | 注册（管理员创建账号） | `register:user:{id}` | 20 次 / 1 小时 | 硬编码 | 429 `RATE_LIMITED` |
 | 修改口令 | `password:{userId}` | 5 次 / 15 分钟 | 硬编码 | 429 `RATE_LIMITED` |
-| 对话 `/api/agent/chat` | `chat:user:{id}` 与 `chat:ip:{ip}` | 20 次 / 5 分钟、60 次 / 5 分钟 | `Limits:AgentChatPerFiveMinutesPerUser` / `...PerIp` | 429 + 审计 `agent.rate-limit` |
+| 对话 `/api/agent/chat` | `chat:user:{id}` 与 `chat:ip:{ip}` | 20 次 / 5 分钟、200 次 / 5 分钟 | `Limits:AgentChatPerFiveMinutesPerUser` / `...PerIp` | 429 + 审计 `agent.rate-limit` |
 | 提交报销单 `/api/invoice/submit` | `invoice:user:{id}` | 30 次 / 5 分钟 | 硬编码 | 429 `RATE_LIMITED` |
 | 报销单审核/修改/删除/回退 | `invoicewrite:{userId}` | 60 次 / 1 分钟 | `Limits:AdminWritePerMinutePerAdmin` | 429 `RATE_LIMITED` |
 | 后台写操作 | `adminwrite:{userId}` | 60 次 / 1 分钟 | `Limits:AdminWritePerMinutePerAdmin` | 429 `RATE_LIMITED` |
-| 所有 `GET /api/*` | `read:user:{id}` 或 `read:ip:{ip}` | 180 次 / 1 分钟 | `Limits:ReadPerMinutePerUser` | 429（`ok` 结构） |
+| 所有 `GET /api/*` | `read:user:{id}` 或 `read:ip:{ip}` | 600 次 / 1 分钟 | `Limits:ReadPerMinutePerUser` | 429（`ok` 结构） |
+
+**请求体 WAF（`Security:WafScanBody`，默认 `true`）**
+
+路径、查询串、请求头之外，**状态变更请求的 JSON body 也会被扫描**（攻击特征藏在 body 里同样拦得住）。扫描前会先还原 `\uXXXX` 与一层 `%XX` 编码，避免用编码绕过。
+
+body 侧用的是**更保守**的特征集——只拦"在本系统任何正常业务里都不该出现"的形态：SQL 注入（`' OR 1=1--`、`union select`、`information_schema`、`xp_cmdshell`、`into outfile`…）、JNDI、SSRF（`gopher://` / `dict://` / `file:///` / 云元数据地址）、CRLF 注入、路径穿越特征。
+
+**XSS / 命令注入 / 模板注入刻意不放进 body 拦截集**：写文件接口会合法写入脚本内容，若在此拦截，正常的"帮我写个脚本"根本提交不了——那类内容由 `ContentRiskScanner` 判定并**强制人工审批**处理。命中 body 规则时返回 `400 {"code":"WAF_BLOCKED"}`，并记审计 `waf.body`、按 WAF 计分。
+
+**IP 白名单（`Security:AllowlistIps`，也可用 `AISERVER_ALLOWLIST_IPS`，分号分隔）**
+
+用于安全测试放行。白名单 IP **只豁免限流与自动封禁**：
+
+- 上表所有限流对该 IP 恒放行（仍计数，`SecurityGuard.AllowlistedHits` 可查）；
+- `IsBanned` 恒 `false`，`Ban` 直接返回，WAF/蜜罐**照常记分但不封禁**；
+- **不豁免**：JWT 校验、请求签名、防重放、权限矩阵、规则引擎、枚举白名单、路径守卫、WAF 拦截本身（命中仍 400）。
+
+只接受可解析的**字面 IP**；`*`、CIDR、域名会在启动时告警并被忽略（不静默放行）。命中默认记审计 `security.allowlist`（`Security:AllowlistAuditEveryHit`，默认 true），`/api/admin/security` 的 `allowlist / allowlistedHits` 字段可查看。
+
+**可信代理与真实 IP 还原（`Security:TrustedProxies`，环境变量 `AISERVER_TRUSTED_PROXIES`）**
+
+协作方网关是服务端代打，所有用户对服务器来说都是同一个来源 IP，会让限流与登录锁定退化成"全局"。为此提供：
+
+- 当 **TCP 对端就是 `TrustedProxies` 里的 IP** 时，采信它带来的 `X-Client-Ip` 头作为请求的真实来源；
+- **其他来源带这个头一律忽略**（防伪造），一律使用 TCP 对端地址；
+- 头值必须能解析成**单个字面 IP**，逗号串 / CIDR / 乱码 → 回退到对端地址，不报错；
+- 生效后，限流、封禁、登录锁定的键、以及审计的 `ip` 字段，全部按真实用户 IP 计算。
+
+`X-Client-Ip` 只用于"还原来源"，不参与鉴权——令牌与签名校验照旧。
 
 `Limits:BizActionPerFiveMinutesPerUser` 与 `Limits:BizActionPerFiveMinutesPerIp` 是旧业务对接台留下的配置项，当前代码里已**没有调用方**（对接台已移除），仅为兼容旧配置文件保留。
 
 账号级防护（`AuthApi` + `UserService`）：
 
-- 连续口令错误达到 `Limits:LoginPerFifteenMinutesPerAccount`（默认 5 次）→ 账号锁定 `Limits:AccountLockMinutes`（默认 15 分钟），状态持久化；锁定期间即使口令正确也返回 401。审计 `auth.lockout`。
+- **锁定按 (来源 IP + 账号) 组合计数**（不再是账号全局锁定）：同一来源对同一账号连续失败达到 `Limits:LoginPerFifteenMinutesPerAccount`（默认 5 次）→ 锁定该**组合** `Limits:AccountLockMinutes`（默认 15 分钟），审计 `auth.lockout`。
+  这样攻击者只能锁死"自己这条 IP 对某个账号"的通道，**无法通过连错他人账号把人锁在门外**；锁定期间该来源用正确口令也被 401 `AUTH_LOCKED`，而**其他来源、其他账号不受影响**。
+- **账号不存在 / 账号被禁用 / 口令错误 三条路径都只跑一次等价的 PBKDF2**，响应时间不可区分（防用户名枚举）；账号级失败次数仅用于审计，不再据此锁定。
 - 账号不存在时同样执行一次等价 PBKDF2 计算（消除用户名枚举的时间差），并额外延迟约 120ms（口令错误约 60ms）。
 - 错误文案统一为「用户名或口令错误」，不泄露账号是否存在。
 
@@ -486,12 +522,10 @@ HTTP 403 { "error": "请求来源不被信任", "code": "BAD_ORIGIN" }
 | --- | --- |
 | `status` | 固定 `ok` |
 | `serverTime` | 服务器 UTC 时间 |
-| `aiConfigured` | 是否配置了可用的 AI 密钥 |
-| `aiModel` | 模型名（未配置时为 `null`） |
-| `aiStatus` | `off` / `degraded` / `online`：只有"最近一次调用成功"才算 `online` |
-| `aiLastSuccessAt` / `aiLastFailureAt` / `aiLastError` | 最近成功/失败时间与错误（脱敏后字符串） |
-| `mode` | 当前模式的文字说明（AI 意图解析 + 审核 / 已降级 / 本地解析） |
-| `selfRegistration` | 是否开放自助注册（读自 `Security:AllowSelfRegistration`）。**注意：该配置项已不再参与注册门禁**，注册现在是"需登录 + `account.create` 权限"，此字段仅作展示，见第 9 节 |
+
+> **刻意只回这两个字段。** 早期版本在这里暴露过 `aiConfigured` / `aiModel` / `aiStatus` / `aiLastError` / `mode` / `selfRegistration`，
+> 等于把"用的哪家模型、AI 开没开、内部错误文案、配置开关状态"免费告诉未认证的扫描者。
+> 需要看 AI 状态的界面改用**登录后**的 `GET /api/auth/me`（该接口返回 `aiConfigured` 与 `aiStatus`）。
 
 **POST `/api/auth/login`** —— 登录换取令牌与签名密钥。
 
@@ -861,13 +895,61 @@ HTTP 403 { "error": "请求来源不被信任", "code": "BAD_ORIGIN" }
 
 请求字段：`versionId`（必填，来自 `/api/admin/versions`；对应版本 `kind` 必须是 `invoice`）、`taskId`（可选）。
 
-行为：按版本的撤销日志分支处理——原动作是 `submit` 则删除该记录（记录已不存在时视为已回退，返回成功）；原动作是 `delete` 则按快照重建（**单号由飞书重新分配**，并另记一条 `rebuild` 版本）；原动作是 `review` 或 `update` 则把快照里的旧值写回。
+行为：按版本的撤销日志分支处理——原动作是 `submit` 则删除该记录（记录已不存在时视为已回退，返回成功）；原动作是 `delete` 则按快照重建（**单号由飞书重新分配**，并另记一条 `rebuild` 版本）；原动作是 `review` 或 `update` 则把快照里的旧值写回（写回前按字段类型归一：`金额` 转数字、日期列转毫秒数字、文本去掉快照里的引号）。
 
 成功（200）`data`：`{ recordId, message }`。
 
 失败码：401、403 `FORBIDDEN`（仅管理员及以上）、429 `RATE_LIMITED`、400 `ROLLBACK_REJECTED`（版本不存在、版本类型不符、已经回退过、快照缺失或飞书不可用）。
 
-### 6.9 已移除的旧接口
+### 6.9 AI 预审与批量审核（AI 只有建议权，没有执行权）
+
+> **设计边界**：本组接口里只有 `batch-review` 会改变单据状态，且必须由财务本人带令牌点击提交。
+> `ai-scores` 与 `ai-find` 是**纯只读**——它们不写飞书、不改状态，只产出等级与候选清单。
+
+#### GET `/api/invoice/ai-scores?refresh=false`
+
+权限：`invoice.review`（财务部 / 管理员 / 超管）。限流：读接口。
+
+行为：拉取报销单列表后逐单产出 **1–4 级** 预审等级：
+先由确定性规则重算（`InvoicePolicy.Evaluate`，免费），再按 `InvoiceAi:BatchSize`（默认 20）分片批量调用 AI 打分，
+最后取 `max(规则等级, AI 等级)`——**AI 只能升级不能降级**。结果按单据内容指纹缓存到 `App_Data/invoice_ai.json`。
+
+**增量规则**：状态为「已通过/已驳回」的单跳过；缓存命中且指纹未变跳过（不重复消耗 AI）；财务改动过关键字段则自动重算。
+`refresh=true` 强制全部重算。
+
+等级 ↔ 颜色：`1` 正常（绿）、`2` 注意（黄）、`3` 危险（橙）、`4` 严重（红）。
+
+成功（200）`data`：`{ aiAvailable, aiError, quotaExhausted, note, stats:{total,skippedDecided,skippedCached,scored,ruleOnly,aiFailedBatches,injected}, rows:[…] }`，
+每行含 `recordId / billNo / applicant / amount / status / hasScore / ruleLevel / aiLevel / finalLevel / levelLabel / ruleSummary / aiReason / suggest / flags / scoredAt`。
+
+AI 未配置或调用失败时：`aiLevel=0`，仍返回规则等级（`aiReason` 说明原因），**不会降级为放行**，也不会写缓存（下次重试）。
+
+#### POST `/api/invoice/ai-find`
+
+请求字段：`requirement`（必填，2–200 字，如"帮我找出所有没问题的单子"）。
+
+行为：把需求 + 在审单据摘要（**转义后**作为不可信数据）交给 AI，AI 只返回候选 `recordId` 列表。
+**服务端二次校验**：编造的 recordId 丢弃、状态已变的丢弃、去重、截断到 `InvoiceAi:MaxFindItems`（默认 50）。
+本接口**不执行任何操作**。
+
+成功（200）`data`：`{ action: "approve|reject|ask", note, message, picked:[{recordId,reason,level,levelLabel,status,applicant,amount,rtype}], dropped:[{recordId,droppedReason}] }`。
+
+失败码：401、403 `FORBIDDEN`、429 `RATE_LIMITED`、400 `AI_FIND_FAILED`（AI 不可用 / 返回不可解析 / 需求非法）。
+
+#### POST `/api/invoice/batch-review`
+
+请求字段：`recordIds`（必填，数组，去重后 ≤ `InvoiceAi:MaxBatchReview` 默认 50）、`action`（`approve` 或 `reject`）、`opinion`（可选补充说明）。
+
+行为：**唯一写入口**。逐单调用单条审核逻辑 `ReviewAsync` —— 每单独立做状态流转校验、归属校验、审批意见长度校验，
+并各自写飞书快照、版本记录与审计（因此每单都能单独回退）。审批人字段写**操作者本人姓名**，从不写 AI。
+部分失败不影响其他单。
+
+成功（200）`data`：`{ status, success, failed, message, items:[{recordId, ok, error, message}] }`。
+
+失败码：401、403 `FORBIDDEN`、429 `RATE_LIMITED`、401 `BAD_SIGNATURE`（缺签名）、
+400 `BAD_ACTION`（action 非 approve/reject）、400 `EMPTY_SELECTION`、400 `BATCH_REJECTED`（超上限或整体拒绝）。
+
+### 6.10 已移除的旧接口
 
 `/api/biz/*`（业务对接台：客户档案与需求单）已随旧业务域一并删除，接口、页面与数据播种都不再存在，相关审计动作名也不会再产生；历史实现可在 git 历史里查到。
 

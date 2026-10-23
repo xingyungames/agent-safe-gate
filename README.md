@@ -208,7 +208,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-all.ps1   # 一键
 node tests/mock-ai.mjs 8963                  # 另开终端：确定性假模型
 node tests/mock-feishu.mjs 8991              # 另开终端：本机假飞书（账号镜像 + 报销单）
 node tests/e2e-account.mjs http://127.0.0.1:8990 http://127.0.0.1:8991   # 92 项：账号权威、四角色、镜像、静默失败
-node tests/e2e-invoice.mjs http://127.0.0.1:8990 http://127.0.0.1:8991   # 51 项：报销单写入口、审核、回退与回退值类型
+node tests/e2e-invoice.mjs http://127.0.0.1:8990 http://127.0.0.1:8991   # 52 项：报销单写入口、审核、回退与回退值类型
 node tests/e2e-feishu-sync.mjs http://127.0.0.1:8990 http://127.0.0.1:8991 # 55 项：账号同步、口令方案升级、越权
 node tests/e2e-p0.mjs http://127.0.0.1:8962                              # 44 项：P0 与文件策略矩阵
 node tests/e2e-agent.mjs http://127.0.0.1:8962                           # 39 项：多步代理与管理端工具
@@ -221,7 +221,7 @@ node tests/frontend-check.mjs AiApprovalServer/wwwroot                    # 前�
 > **参数顺序**：`e2e.mjs` 是 `阶段名 地址`（阶段在前）；账号、报销单与账号同步套件接 `服务地址 假飞书地址`；其余只接地址。
 > **限流阈值**：越权用例会累加攻击计分，批量跑验收时必须放宽
 > `Limits__WafStrikesBeforeBan`、`Limits__HoneypotStrikesBeforeBan`、`Limits__LoginPerFiveMinutesPerIp`（`run-all.ps1` 已代劳）。
-> **离线全绿基线**：目前 385 项断言通过（详见 [docs/测试与验收.md](docs/测试与验收.md)）。
+> **离线全绿基线**：目前 386 项断言通过（详见 [docs/测试与验收.md](docs/测试与验收.md)）。
 
 完整启动方式、前置条件与"如何新增一个用例"见 [docs/测试与验收.md](docs/测试与验收.md)。
 

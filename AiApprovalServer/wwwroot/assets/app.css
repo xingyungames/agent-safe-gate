@@ -302,3 +302,33 @@ pre.code {
 .step-result { margin: 2px 0 6px 24px; }
 .step-result summary { cursor: pointer; font-size: 11px; color: var(--text-mute); }
 .step-result pre { margin-top: 6px; max-height: 220px; }
+
+/* ---------------------------------------------------------------- AI 预审等级（1-4） */
+.badge.lvl0 { background: rgba(100, 116, 139, .16); color: #a8b6c9; border-color: rgba(100, 116, 139, .35); }
+.badge.lvl1 { background: rgba(34, 197, 94, .14); color: #6ee7a5; border-color: rgba(34, 197, 94, .35); }
+.badge.lvl2 { background: rgba(234, 179, 8, .16); color: #fde047; border-color: rgba(234, 179, 8, .42); }
+.badge.lvl3 { background: rgba(249, 115, 22, .16); color: #fdba74; border-color: rgba(249, 115, 22, .42); }
+.badge.lvl4 { background: rgba(239, 68, 68, .18); color: #fca5a5; border-color: rgba(239, 68, 68, .45); }
+
+/* 行首竖条提示等级，不干扰表格配色 */
+tr.ailvl1 td:first-child { box-shadow: inset 3px 0 0 #22c55e; }
+tr.ailvl2 td:first-child { box-shadow: inset 3px 0 0 #eab308; }
+tr.ailvl3 td:first-child { box-shadow: inset 3px 0 0 #f97316; }
+tr.ailvl4 td:first-child { box-shadow: inset 3px 0 0 #ef4444; }
+
+/* AI 建议区 */
+.ai-box { border: 1px solid var(--line-soft); border-radius: 8px; padding: 10px; background: #0d1729; }
+.ai-box + .ai-box { margin-top: 10px; }
+.ai-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.ai-toolbar .grow { flex: 1 1 220px; min-width: 180px; }
+.ai-stat { font-size: 11px; color: var(--text-mute); margin-top: 6px; line-height: 1.7; }
+.ai-pick-list { max-height: 240px; overflow: auto; margin-top: 8px; border-top: 1px dashed var(--line); padding-top: 8px; }
+.ai-pick-item { display: flex; gap: 8px; align-items: flex-start; padding: 5px 0; border-bottom: 1px solid var(--line-soft); font-size: 12px; }
+.ai-pick-item:last-child { border-bottom: none; }
+.ai-pick-item .txt { flex: 1 1 auto; word-break: break-word; }
+.ai-pick-item .why { color: var(--text-mute); font-size: 11px; }
+.pick-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.pick-title { font-size: 12px; color: var(--text); }
+.pick-id { font-size: 10px; color: var(--text-mute); font-family: var(--mono); }
+.ai-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+

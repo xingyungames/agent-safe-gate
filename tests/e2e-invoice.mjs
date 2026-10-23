@@ -104,6 +104,8 @@ if (delVersion) {
   const list3 = await call('GET', '/api/invoice/list', { token: adm.token });
   const rebuilt = (list3.body?.data?.rows || []).find(r => r.reason === '修正后的事由说明');
   check('重建后的单据字段与快照一致', !!rebuilt, JSON.stringify((list3.body?.data?.rows || []).map(r => r.reason)));
+  const rebuiltFields = await mockRow(rb.body?.data?.recordId || '');
+  check('重建后的金额是数字类型', typeof rebuiltFields?.['金额'] === 'number', JSON.stringify(rebuiltFields?.['金额']));
   const rbAgain = await call('POST', '/api/invoice/rollback', { token: adm.token, signKey: adm.signKey, body: { versionId: delVersion.id } });
   check('同一版本不可重复回退', rbAgain.status === 400, `status=${rbAgain.status} msg=${rbAgain.body?.message}`);
 }

@@ -18,6 +18,18 @@ const requests = [];
 const DEFAULT_FIELDS = ['单号', '申请人', '工号', '部门', '报销类型', '金额', '事由', '票据状态', '城市',
   '发票日期', '记录提交时间', '合规结果', '风险摘要', '状态', '审核人', '审批意见', '审批时间', '发票信息', '发票附件'];
 
+// 真实飞书的类型硬要求：金额(Currency)必须是数字，日期(DateTime)必须是毫秒数字
+function validateFieldTypes(fields) {
+  if (!fields || typeof fields !== 'object') return null;
+  for (const [name, value] of Object.entries(fields)) {
+    if (name === '金额' && typeof value !== 'number') return { code: 1254001, msg: 'WrongRequestBody' };
+    if (['发票日期', '记录提交时间', '审批时间'].includes(name) && typeof value !== 'number') {
+      return { code: 1254064, msg: 'DatetimeFieldConvFail' };
+    }
+  }
+  return null;
+}
+
 // 取或建某张表
 function tableOf(tableId) {
   if (!tables.has(tableId)) tables.set(tableId, new Map());
@@ -209,6 +221,8 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST') {
       counters.create++;
+      const bad = validateFieldTypes(fields);
+      if (bad) return feishuError(res, bad.code, bad.msg);
       const id = nextRecordId();
       // 单号自动补号
       const stored = { ...fields };
@@ -219,6 +233,8 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'PUT') {
       counters.update++;
+      const bad = validateFieldTypes(fields);
+      if (bad) return feishuError(res, bad.code, bad.msg);
       const existing = tableOf(tableId).get(recordId);
       if (!existing) return feishuError(res, 1254043, 'record not found');
       const merged = { ...existing, ...fields };

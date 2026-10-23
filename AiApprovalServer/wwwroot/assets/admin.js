@@ -191,9 +191,140 @@
     return el('pre', 'code', U.unescapeUnicode(text));
   }
 
+  //报销单 AI 等级徽标
+  function aiLevelBadge(level) {
+    var n = Number(level) || 0;
+    var cls = (n >= 1 && n <= 4) ? 'lvl' + n : 'lvl0';
+    var text = n === 1 ? '1 正常' : n === 2 ? '2 注意' : n === 3 ? '3 危险' : n === 4 ? '4 严重' : '未评分';
+    return badge(text, cls);
+  }
+
+  //加载报销单 AI 建议（只读：本页没有任何执行入口）
+  function loadInvoiceAi(body) {
+    U.clear(body);
+
+    var note = el('div', 'banner info');
+    note.textContent = '管理台只展示 AI 建议。系统不存在由 AI 触发审批或执行的接口：' +
+      '审批必须由人或财务在各自界面点击，且每次写操作都会独立留快照与审计。';
+    body.appendChild(note);
+
+    var bar = el('div', 'row');
+    var refreshBtn = el('button', 'small', '刷新 AI 预审');
+    refreshBtn.type = 'button';
+    bar.appendChild(refreshBtn);
+
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'grow';
+    input.maxLength = 200;
+    input.placeholder = '让 AI 按需求筛单（例如：找出所有没问题的单子）';
+    bar.appendChild(input);
+
+    var findBtn = el('button', 'small ghost', 'AI 筛单');
+    findBtn.type = 'button';
+    bar.appendChild(findBtn);
+    body.appendChild(bar);
+
+    var stat = el('div', 'ai-stat');
+    body.appendChild(stat);
+
+    var tableHost = el('div', 'list');
+    tableHost.textContent = '加载中…';
+    body.appendChild(tableHost);
+
+    var pickHost = el('div', 'ai-pick-list');
+    body.appendChild(pickHost);
+
+    function renderScores(rows) {
+      U.clear(tableHost);
+      if (!rows.length) {
+        tableHost.appendChild(el('div', 'empty', '暂无单据'));
+        return;
+      }
+
+      var t = el('table');
+      var thead = el('thead');
+      var hr = el('tr');
+      ['单号', '申请人', '类型', '金额', 'AI 等级', 'AI 理由', '规则摘要', '状态'].forEach(function (x) {
+        hr.appendChild(el('th', null, x));
+      });
+      thead.appendChild(hr);
+      t.appendChild(thead);
+
+      var tbody = el('tbody');
+      rows.forEach(function (r) {
+        var tr = el('tr');
+        tr.appendChild(el('td', null, r.billNo || '-'));
+        tr.appendChild(el('td', null, r.applicant || '-'));
+        tr.appendChild(el('td', null, r.rtype || '-'));
+        tr.appendChild(el('td', null, r.amount === undefined ? '-' : String(r.amount)));
+
+        var lvlCell = el('td');
+        lvlCell.appendChild(aiLevelBadge(r.hasScore ? r.finalLevel : 0));
+        tr.appendChild(lvlCell);
+
+        tr.appendChild(el('td', null, r.aiReason || '-'));
+        tr.appendChild(el('td', null, r.ruleSummary || '-'));
+        tr.appendChild(el('td', null, r.status || '-'));
+        tbody.appendChild(tr);
+      });
+      t.appendChild(tbody);
+      tableHost.appendChild(t);
+    }
+
+    function load(refresh) {
+      tableHost.textContent = '加载中…';
+      API.get('/api/admin/invoice-ai/scores' + (refresh ? '?refresh=true' : '')).then(function (res) {
+        var d = res.data || {};
+        stat.textContent = '已评分 ' + (d.scoredCount || 0) + ' / ' + (d.total || 0) + ' 单' +
+          (d.aiError ? '　AI 提示：' + d.aiError : '');
+        renderScores(d.rows || []);
+      }).catch(function (err) {
+        tableHost.textContent = '加载失败：' + err.message;
+      });
+    }
+
+    refreshBtn.addEventListener('click', function () { load(true); });
+
+    findBtn.addEventListener('click', function () {
+      var q = input.value.trim();
+      if (q.length < 2) { U.toast('请先描述要筛的单（至少 2 个字）', 'warn'); return; }
+
+      findBtn.disabled = true;
+      API.get('/api/admin/invoice-ai/find?q=' + encodeURIComponent(q)).then(function (res) {
+        var d = res.data || {};
+        U.clear(pickHost);
+        pickHost.appendChild(el('div', 'ai-stat', d.note ? String(d.note) : ''));
+
+        var picked = d.picked || [];
+        picked.forEach(function (p) {
+          var row = el('div', 'ai-pick-item');
+          var txt = el('div', 'txt');
+          txt.appendChild(el('div', null, p.summary || p.billNo || (p.recordId || '-')));
+          if (p.reason) txt.appendChild(el('div', 'why', 'AI：' + p.reason));
+          row.appendChild(txt);
+
+          var lv = el('div');
+          lv.appendChild(aiLevelBadge(p.level));
+          row.appendChild(lv);
+          pickHost.appendChild(row);
+        });
+
+        (d.dropped || []).forEach(function (x) {
+          pickHost.appendChild(el('div', 'hint', '已剔除 ' + (x.recordId || '') + '：' + (x.droppedReason || '')));
+        });
+
+        U.toast('AI 已给出 ' + picked.length + ' 条建议（未执行任何操作）', 'info');
+      }).catch(function (err) {
+        U.toast('AI 筛单失败：' + err.message, 'bad');
+      }).then(function () { findBtn.disabled = false; });
+    });
+
+    load(false);
+  }
+
   //切换标签
-  function switchTab(name) {
-    state.tab = name;
+  function switchTab(name) {    state.tab = name;
     Array.prototype.forEach.call(document.querySelectorAll('#admin-tabs .tab'), function (t) {
       t.classList.toggle('active', t.getAttribute('data-tab') === name);
     });
@@ -210,6 +341,7 @@
       case 'audit': loadAudit(body); break;
       case 'outbox': loadOutbox(body); break;
       case 'datasets': loadDatasets(body); break;
+      case 'invoiceai': loadInvoiceAi(body); break;
       case 'security': loadSecurity(body); break;
       default: body.textContent = '未知标签';
     }

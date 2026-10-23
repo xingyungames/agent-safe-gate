@@ -12,34 +12,12 @@
 
   //页面启动
   function boot() {
-    API.publicGet('/api/public/health').then(function (res) {
-      state.health = res.data;
-      var aiStatus = res.data.aiStatus || (res.data.aiConfigured ? 'online' : 'off');
-
+    API.publicGet('/api/public/health').then(function () {
       var banner = document.getElementById('env-banner');
       U.clear(banner);
-      banner.appendChild(el('div', null, '服务已就绪。' + res.data.mode));
-      banner.appendChild(el('div', 'hint',
-        'AI 状态：' + (aiStatus === 'online' ? '在线' : aiStatus === 'degraded' ? '降级（调用失败）' : '未配置')
-        + (aiStatus === 'degraded' && res.data.aiLastError ? '　原因：' + res.data.aiLastError : '')
-        + '；自助注册：' + (res.data.selfRegistration ? '开启（仅用户角色）' : '已关闭')));
-
-      var mode = document.getElementById('ai-mode');
-      if (aiStatus === 'online') {
-        mode.textContent = 'AI 在线';
-        mode.className = 'badge ok';
-      } else if (aiStatus === 'degraded') {
-        mode.textContent = 'AI 降级';
-        mode.className = 'badge warn';
-      } else {
-        mode.textContent = '本地模式';
-        mode.className = 'badge warn';
-      }
-
-      var hint = document.getElementById('mode-hint');
-      hint.textContent = aiStatus === 'online'
-        ? 'AI 负责理解意图；能否执行由规则引擎 + AI 安全审核 + 人工审批决定。'
-        : 'AI 不可用：使用本地指令解析，变更类操作全部转人工审批（防线不降级）。';
+      banner.appendChild(el('div', null, '服务已就绪。'));
+      banner.appendChild(el('div', 'hint', 'AI 状态与权限在登录后显示。'));
+      applyAiBadge(null);
     }).catch(function (err) {
       document.getElementById('env-banner').textContent = '无法连接服务：' + err.message;
     });
@@ -48,6 +26,35 @@
       API.get('/api/auth/me').then(function () { enterConsole(); }).catch(function () { showLogin(); });
     } else {
       showLogin();
+    }
+  }
+
+  //AI 状态徽标：公开探针不再暴露，只在登录后按 /api/auth/me 渲染
+  function applyAiBadge(me) {
+    var mode = document.getElementById('ai-mode');
+    var hint = document.getElementById('mode-hint');
+    if (!mode || !hint) return;
+
+    if (!me) {
+      mode.textContent = '待登录';
+      mode.className = 'badge muted';
+      hint.textContent = '登录后显示 AI 状态。';
+      return;
+    }
+
+    var aiStatus = me.aiStatus || (me.aiConfigured ? 'online' : 'off');
+    if (aiStatus === 'online') {
+      mode.textContent = 'AI 在线';
+      mode.className = 'badge ok';
+      hint.textContent = 'AI 负责理解意图；能否执行由规则引擎 + AI 安全审核 + 人工审批决定。';
+    } else if (aiStatus === 'degraded') {
+      mode.textContent = 'AI 降级';
+      mode.className = 'badge warn';
+      hint.textContent = 'AI 调用失败：使用本地指令解析，变更类操作全部转人工审批（防线不降级）。';
+    } else {
+      mode.textContent = '本地模式';
+      mode.className = 'badge warn';
+      hint.textContent = 'AI 不可用：使用本地指令解析，变更类操作全部转人工审批（防线不降级）。';
     }
   }
 
@@ -62,6 +69,7 @@
   //进入工作台
   function enterConsole() {
     var user = API.session().user;
+    API.get('/api/auth/me').then(function (res) { applyAiBadge(res.data); }).catch(function () { /* 忽略 */ });
     document.getElementById('login-view').hidden = true;
     document.getElementById('console-view').hidden = false;
     document.getElementById('userbox').hidden = false;
@@ -89,24 +97,6 @@
       document.getElementById('login-pass').value = '';
       U.toast('登录成功', 'ok');
       enterConsole();
-    }).catch(function (err) {
-      U.toast(err.message, 'bad');
-    });
-  }
-
-  //提交注册
-  function register() {
-    var payload = {
-      userName: document.getElementById('reg-user').value.trim(),
-      displayName: document.getElementById('reg-display').value.trim(),
-      password: document.getElementById('reg-pass').value,
-      email: document.getElementById('reg-email').value.trim()
-    };
-
-    API.public('/api/auth/register', payload).then(function (res) {
-      U.toast(res.data.message, 'ok');
-      document.getElementById('login-user').value = payload.userName;
-      document.getElementById('register-card').hidden = true;
     }).catch(function (err) {
       U.toast(err.message, 'bad');
     });
@@ -501,13 +491,6 @@
   function bind() {
     document.getElementById('btn-login').addEventListener('click', login);
     document.getElementById('login-pass').addEventListener('keydown', function (e) { if (e.key === 'Enter') login(); });
-    document.getElementById('btn-register').addEventListener('click', register);
-    document.getElementById('btn-show-register').addEventListener('click', function () {
-      document.getElementById('register-card').hidden = false;
-    });
-    document.getElementById('btn-hide-register').addEventListener('click', function () {
-      document.getElementById('register-card').hidden = true;
-    });
     document.getElementById('btn-send').addEventListener('click', send);
     document.getElementById('chat-input').addEventListener('keydown', function (e) {
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) send();

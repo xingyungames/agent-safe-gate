@@ -9,7 +9,13 @@
     meta: null,
     rows: [],
     selected: null,
-    filters: { status: '', type: '', department: '', keyword: '' }
+    filters: { status: '', type: '', department: '', keyword: '' },
+    //AI 预审：recordId -> 评分视图；AI 选单候选
+    scores: {},
+    aiStats: null,
+    aiAvailable: true,
+    aiError: '',
+    aiPicked: []
   };
 
   var FINANCE_ROLES = { finance: 1, admin: 1, superadmin: 1 };
@@ -48,6 +54,28 @@
 
   //生成状态徽标
   function badge(text, cls) { return el('span', 'badge ' + (cls || 'info'), text); }
+
+  //AI 等级样式类（1-4，0=未评分）
+  function lvlClass(level) {
+    var n = Number(level) || 0;
+    return (n >= 1 && n <= 4) ? 'lvl' + n : 'lvl0';
+  }
+
+  //AI 等级中文标签
+  function lvlText(level) {
+    switch (Number(level) || 0) {
+      case 1: return '1 正常';
+      case 2: return '2 注意';
+      case 3: return '3 危险';
+      case 4: return '4 严重';
+      default: return '未评分';
+    }
+  }
+
+  //取某单的 AI 评分
+  function scoreOf(recordId) {
+    return state.scores[recordId] || null;
+  }
 
   var HTTPS_PREFIX = 'https://';
 
@@ -210,6 +238,7 @@
 
     loadMeta();
     loadList();
+    loadScores(false);
   }
 
   //提交登录
@@ -346,7 +375,7 @@
     var t = el('table');
     var thead = el('thead');
     var headRow = el('tr');
-    ['单号', '申请人', '工号', '部门', '报销类型', '金额', '票据状态', '合规结果', '风险摘要', '状态', '审核人'].forEach(function (title) {
+    ['单号', '申请人', '工号', '部门', '报销类型', '金额', '票据状态', '合规结果', '风险摘要', 'AI 预审', '状态', '审核人'].forEach(function (title) {
       headRow.appendChild(el('th', null, title));
     });
     thead.appendChild(headRow);
@@ -377,6 +406,19 @@
       var riskCell = el('td');
       riskCell.textContent = elText(row.riskSummary);
       tr.appendChild(riskCell);
+
+      //AI 预审等级（只读建议，不改变单据状态）
+      var aiCell = el('td');
+      var score = scoreOf(row.recordId);
+      var lvl = score ? Number(score.finalLevel) || 0 : 0;
+      aiCell.appendChild(badge(lvlText(lvl), lvlClass(lvl)));
+      if (score && score.aiReason) {
+        var why = el('div', 'hint');
+        why.textContent = score.aiReason;
+        aiCell.appendChild(why);
+      }
+      tr.appendChild(aiCell);
+      if (lvl >= 1 && lvl <= 4) tr.classList.add('ailvl' + lvl);
 
       var statusCell = el('td');
       statusCell.appendChild(badge(elText(row.status), statusClass(row.status)));
@@ -598,6 +640,144 @@
     return wrap;
   }
 
+  //AI 预审与批量助手（全部只出建议；执行只由下面的按钮触发）
+
+  //拉取 AI 评分：默认命中缓存不重复花钱，refresh=true 才强制重算
+  function loadScores(force) {
+    var btn = document.getElementById('btn-ai-score');
+    if (btn) { btn.disabled = true; btn.textContent = force ? '预审中…' : '加载中…'; }
+
+    var path = '/api/invoice/ai-scores' + (force ? '?refresh=true' : '');
+    API.get(path).then(function (res) {
+      var data = res.data || {};
+      state.scores = {};
+      (data.rows || []).forEach(function (r) {
+        if (r && r.hasScore) state.scores[r.recordId] = r;
+      });
+      state.aiStats = data.stats || null;
+      state.aiAvailable = data.aiAvailable !== false;
+      state.aiError = data.aiError || '';
+      renderList();
+      if (state.aiError) U.toast('AI 预审部分不可用：' + state.aiError, 'warn');
+    }).catch(function (err) {
+      U.toast('AI 预审失败：' + describeError(err), 'bad');
+    }).then(function () {
+      if (btn) { btn.disabled = false; btn.textContent = 'AI 预审'; }
+    });
+  }
+
+  //让 AI 按需求选单（只出清单）
+  function aiFind() {
+    var input = document.getElementById('ai-req');
+    var req = input.value.trim();
+    if (req.length < 2) { U.toast('请先描述你要找的单（至少 2 个字）', 'warn'); return; }
+
+    var btn = document.getElementById('btn-ai-find');
+    btn.disabled = true; btn.textContent = '筛选…';
+
+    API.post('/api/invoice/ai-find', { requirement: req }).then(function (res) {
+      var data = res.data || {};
+      state.aiPicked = (data.picked || []).map(function (p) {
+        return {
+          recordId: p.recordId,
+          billNo: p.billNo || '',
+          summary: p.summary || '',
+          level: p.level || 0,
+          levelLabel: p.levelLabel || '',
+          reason: p.reason || '',
+          checked: true
+        };
+      });
+      renderAiPicks(data);
+      U.toast('AI 已列出 ' + state.aiPicked.length + ' 条候选，尚未执行任何操作', 'info');
+    }).catch(function (err) {
+      U.toast('AI 找单失败：' + describeError(err), 'bad');
+    }).then(function () { btn.disabled = false; btn.textContent = '让 AI 找单'; });
+  }
+
+  //渲染 AI 候选清单（可勾选，勾选状态由财务掌控）
+  function renderAiPicks(data) {
+    data = data || {};
+    var note = document.getElementById('ai-find-note');
+    var host = U.clear(document.getElementById('ai-pick-host'));
+    var approveBtn = document.getElementById('btn-ai-approve');
+    var rejectBtn = document.getElementById('btn-ai-reject');
+    var clearBtn = document.getElementById('btn-ai-clear');
+
+    var actionLabel = data.action === 'approve' ? '建议通过'
+      : data.action === 'reject' ? '建议打回' : '需求不明确';
+
+    if (!state.aiPicked.length) {
+      note.textContent = data.note ? String(data.note) : '';
+      host.appendChild(el('div', 'empty', '暂无候选清单'));
+      approveBtn.hidden = true; rejectBtn.hidden = true; clearBtn.hidden = true;
+      return;
+    }
+
+    var dropped = data.dropped || [];
+    note.textContent = (data.note ? data.note + '；' : '') +
+      'AI ' + actionLabel + '，候选 ' + state.aiPicked.length + ' 条' +
+      (dropped.length ? '，已剔除 ' + dropped.length + ' 条（不存在或状态已变）' : '') +
+      '\n提示：勾选后点按钮才会真正执行；每单独立留快照可回退。';
+
+    state.aiPicked.forEach(function (item, index) {
+      var row = document.createElement('div');
+      row.className = 'ai-pick-item';
+
+      var box = document.createElement('input');
+      box.type = 'checkbox';
+      box.checked = item.checked;
+      box.addEventListener('change', function () { state.aiPicked[index].checked = box.checked; });
+      row.appendChild(box);
+
+      var txt = el('div', 'txt');
+      var head = el('div', 'pick-head');
+      //优先显示单号与摘要（recordId 是哈希串，人认不出来）
+      head.appendChild(el('span', 'pick-title',
+        item.summary || item.billNo || elText(item.recordId)));
+      if (item.level >= 1 && item.level <= 4) head.appendChild(badge(lvlText(item.level), lvlClass(item.level)));
+      txt.appendChild(head);
+
+      if (!item.summary && item.billNo) txt.appendChild(el('div', 'why', '单号：' + item.billNo));
+      if (item.reason) txt.appendChild(el('div', 'why', 'AI：' + item.reason));
+      txt.appendChild(el('div', 'pick-id', '记录 ID（后台用）：' + elText(item.recordId)));
+      row.appendChild(txt);
+
+      host.appendChild(row);
+    });
+
+    approveBtn.hidden = false;
+    rejectBtn.hidden = false;
+    clearBtn.hidden = false;
+  }
+
+  //批量执行：唯一写入口，必须财务本人点击
+  function aiBatch(action) {
+    var ids = state.aiPicked.filter(function (p) { return p.checked; })
+      .map(function (p) { return p.recordId; });
+    if (!ids.length) { U.toast('请先勾选要处理的单据', 'warn'); return; }
+
+    var head = action === 'approve' ? '全部通过' : '全部打回';
+    var ok = window.confirm('将对勾选的 ' + ids.length + ' 单执行「' + head + '」。\n' +
+      '每单都会独立留存快照与审计，可单独回退。是否继续？');
+    if (!ok) return;
+
+    API.post('/api/invoice/batch-review', {
+      recordIds: ids,
+      action: action,
+      opinion: '财务核对 AI 清单后批量处理'
+    }).then(function (res) {
+      var d = res.data || {};
+      U.toast(d.message || '已处理', d.failed ? 'warn' : 'ok');
+      state.aiPicked = [];
+      renderAiPicks({});
+      loadList();
+      loadScores(false);
+    }).catch(function (err) {
+      U.toast('批量处理失败：' + describeError(err), 'bad');
+    });
+  }
+
   //筛选与事件绑定
 
   //读取筛选条件
@@ -627,6 +807,20 @@
       });
     });
     document.getElementById('btn-refresh').addEventListener('click', function () { loadList(); });
+
+    //AI 预审与批量助手
+    document.getElementById('btn-ai-score').addEventListener('click', function () { loadScores(true); });
+    document.getElementById('btn-ai-find').addEventListener('click', aiFind);
+    document.getElementById('btn-ai-approve').addEventListener('click', function () { aiBatch('approve'); });
+    document.getElementById('btn-ai-reject').addEventListener('click', function () { aiBatch('reject'); });
+    document.getElementById('btn-ai-clear').addEventListener('click', function () {
+      state.aiPicked = [];
+      document.getElementById('ai-req').value = '';
+      renderAiPicks({});
+    });
+    document.getElementById('ai-req').addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') aiFind();
+    });
     document.getElementById('btn-clear-filter').addEventListener('click', function () {
       document.getElementById('filter-status').value = '';
       document.getElementById('filter-type').value = '';

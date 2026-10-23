@@ -69,6 +69,7 @@
           报销单列表
           <span class="spacer"></span>
           <span class="hint" id="count-label">尚未加载</span>
+          <button class="small ghost" id="btn-ai-score" type="button">AI 预审</button>
           <button class="small" id="btn-refresh" type="button">刷新</button>
         </div>
         <div class="card-body">
@@ -90,6 +91,34 @@
         <div class="card-head">单据详情与操作</div>
         <div class="card-body" id="detail-host">
           <div class="empty">在左侧列表选择一条报销单</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          AI 批量助手
+          <span class="spacer"></span>
+          <span class="badge info">仅建议</span>
+        </div>
+        <div class="card-body">
+          <div class="hint">
+            描述你要找的单，AI 只列出候选清单，<strong>不会改动任何单据</strong>。
+            你确认勾选并点按钮后，后端才逐单走正式审核（每单独立快照与审计，可单独回退）。
+          </div>
+          <div class="divider"></div>
+          <div class="ai-box">
+            <div class="ai-toolbar">
+              <input type="text" id="ai-req" class="grow" maxlength="200" placeholder="例如：帮我找出所有没问题的单子">
+              <button class="small" id="btn-ai-find" type="button">让 AI 找单</button>
+            </div>
+            <div class="ai-stat" id="ai-find-note"></div>
+            <div class="ai-pick-list" id="ai-pick-host"></div>
+            <div class="ai-actions">
+              <button class="small primary" id="btn-ai-approve" type="button" hidden>全部同意审批</button>
+              <button class="small ghost" id="btn-ai-reject" type="button" hidden>全部打回</button>
+              <button class="small ghost" id="btn-ai-clear" type="button" hidden>清空清单</button>
+            </div>
+          </div>
         </div>
       </div>
 

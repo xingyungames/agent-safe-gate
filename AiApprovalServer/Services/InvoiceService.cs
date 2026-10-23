@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Collections.Concurrent;
 using AiApproval.Core;
 using AiApproval.Security;
 using AiApproval.Tools;
@@ -41,6 +42,24 @@ public sealed record InvoiceResult(bool Ok, string Error = "", string RecordId =
     public static InvoiceResult Fail(string error) => new(false, error);
 }
 
+//批量审核的单条结果
+public sealed class BatchReviewItem
+{
+    public string RecordId { get; set; } = "";
+    public bool Ok { get; set; }
+    public string Error { get; set; } = "";
+    public string Message { get; set; } = "";
+}
+
+//批量审核汇总
+public sealed class BatchReviewResult
+{
+    public string Error { get; set; } = "";
+    public List<BatchReviewItem> Items { get; set; } = new();
+    public int Success { get; set; }
+    public int Failed { get; set; }
+}
+
 //报销单服务：唯一写入口
 public sealed class InvoiceService
 {
@@ -48,6 +67,10 @@ public sealed class InvoiceService
     private readonly FeishuApi _api;
     private readonly VersionStore _versions;
     private readonly AuditLog _audit;
+
+    //短期幂等：同一用户 90 秒内提交内容完全相同的单据，直接返回上一次结果（防连点/重试造成重复行）
+    private readonly ConcurrentDictionary<string, (string RecordId, string BillNo, string Message, DateTime At)>
+        _recentSubmits = new(StringComparer.Ordinal);
     private readonly ILogger<InvoiceService> _logger;
 
     public InvoiceService(AppConfig cfg, FeishuApi api, VersionStore versions, AuditLog audit, ILogger<InvoiceService> logger)
@@ -136,9 +159,19 @@ public sealed class InvoiceService
             return InvoiceResult.Fail(error);
         }
 
-        //只写表里真实存在的列
-        var fields = new Dictionary<string, object?>
+        //幂等闸门：90 秒内同样的单据只写一次（前端连点 / 网关重试 / 超时重发都合并成一次）
+        var idemKey = SubmitKey(identity, draft);
+        if (_recentSubmits.TryGetValue(idemKey, out var last) && DateTime.UtcNow - last.At < TimeSpan.FromSeconds(90))
         {
+            await _audit.WriteAsync(identity.User.Id, identity.User.UserName, identity.User.Role, identity.Ip,
+                "invoice.submit", last.RecordId, "DUPLICATE-MERGED",
+                $"90 秒内重复提交相同单据，已直接返回上次结果（单号={last.BillNo}），未重复写表").ConfigureAwait(false);
+            return new InvoiceResult(true, "", last.RecordId,
+                $"重复提交已合并（未重复写表）：单号 {last.BillNo}") { BillNo = last.BillNo };
+        }
+
+        //只写表里真实存在的列
+        var fields = new Dictionary<string, object?>        {
             [InvoicePolicy.FieldApplicant] = identity.User.DisplayName,
             [InvoicePolicy.FieldEmployeeId] = identity.User.EmployeeId,
             [InvoicePolicy.FieldDepartment] = draft.Department,
@@ -183,11 +216,34 @@ public sealed class InvoiceService
                 "invoice.submit", recordId, "SUCCESS",
                 $"报销单已写入飞书：单号={billNo} {draft.Type} {draft.Amount} 元，合规={compliance.Result}，版本={version.Id}").ConfigureAwait(false);
 
-            return new InvoiceResult(true, "", recordId,
-                $"报销单已提交：单号 {billNo}，{draft.Type} {draft.Amount:0.##} 元，合规结果 {compliance.Result}")
+            var okMessage = $"报销单已提交：单号 {billNo}，{draft.Type} {draft.Amount:0.##} 元，合规结果 {compliance.Result}";
+            Remember(idemKey, recordId, billNo, okMessage);
+
+            return new InvoiceResult(true, "", recordId, okMessage)
             {
                 BillNo = billNo,
             };
+        }
+        catch (FeishuApiException ex) when (ex.UnknownState)
+        {
+            //写入结果未知（超时/连接中断）：绝不重试。先回查——真写进去了就认领，没写进去才允许用户重提
+            var adopted = await TryAdoptAsync(identity, fields, ct).ConfigureAwait(false);
+            if (!string.IsNullOrEmpty(adopted))
+            {
+                var billNo = await FetchBillNoAsync(adopted, ct).ConfigureAwait(false);
+                var msg = $"报销单已提交（写入超时后回查确认成功）：单号 {billNo}，{draft.Type} {draft.Amount:0.##} 元";
+                Remember(idemKey, adopted, billNo, msg);
+                await _audit.WriteAsync(identity.User.Id, identity.User.UserName, identity.User.Role, identity.Ip,
+                    "invoice.submit", adopted, "SUCCESS",
+                    $"飞书写入超时（{Describe(ex)}），回查确认已写入并认领该行，未重复写单；单号={billNo}").ConfigureAwait(false);
+                return new InvoiceResult(true, "", adopted, msg) { BillNo = billNo };
+            }
+
+            var unknownMsg = "提交超时，且回查未发现该单据：本次确认**没有**写入，可以安全地重新提交";
+            await _audit.WriteAsync(identity.User.Id, identity.User.UserName, identity.User.Role, identity.Ip,
+                "invoice.submit", "报销单主表", "UNKNOWN",
+                $"飞书写入超时（{Describe(ex)}），回查未命中，未写入；已阻止自动重试以免重复写单").ConfigureAwait(false);
+            return InvoiceResult.Fail(unknownMsg);
         }
         catch (Exception ex)
         {
@@ -226,9 +282,58 @@ public sealed class InvoiceService
             $"审核={newStatus}", ct).ConfigureAwait(false);
     }
 
+    //批量审核：逐单复用单条写入口，逐单回报，部分失败不影响其他单
+    public async Task<BatchReviewResult> BatchReviewAsync(RequestIdentity identity, IReadOnlyList<string> recordIds,
+        string newStatus, string opinion, CancellationToken ct = default)
+    {
+        var result = new BatchReviewResult();
+
+        var ids = recordIds
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x.Trim())
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var cap = Math.Clamp(_cfg.InvoiceAi.MaxBatchReview, 1, 200);
+        if (ids.Count > cap)
+        {
+            result.Error = $"一次最多处理 {cap} 单（本次 {ids.Count} 单），请分批执行";
+            return result;
+        }
+        if (ids.Count == 0)
+        {
+            result.Error = "没有要处理的单据";
+            return result;
+        }
+
+        foreach (var id in ids)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            //每单都走完整写入口：状态流转校验 + 意见长度 + 归属校验 + 快照 + 版本 + 审计
+            var one = await ReviewAsync(identity, id, newStatus, opinion, "", ct).ConfigureAwait(false);
+
+            result.Items.Add(new BatchReviewItem
+            {
+                RecordId = id,
+                Ok = one.Ok,
+                Error = one.Error,
+                Message = one.Message,
+            });
+
+            if (one.Ok) result.Success++;
+            else result.Failed++;
+        }
+
+        await _audit.WriteAsync(identity.User.Id, identity.User.UserName, identity.User.Role, identity.Ip,
+            "invoice.batch", "报销单主表", result.Failed == 0 ? "SUCCESS" : "PARTIAL",
+            $"批量审核={newStatus}：共 {result.Items.Count} 单，成功 {result.Success}，失败 {result.Failed}").ConfigureAwait(false);
+
+        return result;
+    }
+
     //修改报销单字段
-    public async Task<InvoiceResult> UpdateAsync(RequestIdentity identity, string recordId,
-        IDictionary<string, string> patch, string taskId, CancellationToken ct = default)
+    public async Task<InvoiceResult> UpdateAsync(RequestIdentity identity, string recordId,        IDictionary<string, string> patch, string taskId, CancellationToken ct = default)
     {
         if (!Enabled) return InvoiceResult.Fail(DisabledReason);
 
@@ -426,7 +531,7 @@ public sealed class InvoiceService
                                  .Concat(new[] { InvoicePolicy.FieldStatus, InvoicePolicy.FieldReviewer, InvoicePolicy.FieldReviewOpinion }))
                     {
                         if (oldFields.TryGetValue(name, out var v))
-                            restore[name] = UnwrapSnapshotValue(v);
+                            restore[name] = CoerceSnapshotValue(name, v);
                         else if (InvoicePolicy.ClearWhenAbsentFields.Contains(name))
                             restore[name] = "";   //快照里没有 = 当时就是空的，回退要把它清掉
                     }
@@ -509,6 +614,54 @@ public sealed class InvoiceService
     }
 
     //JSON 转一行
+    //幂等键：用户 + 单据内容
+    private static string SubmitKey(RequestIdentity identity, InvoicePolicy.SubmitDraft d)
+        => string.Join('|',
+            identity.User.Id, d.Department, d.Type, d.Amount.ToString("0.##"), d.Reason.Trim(),
+            d.InvoiceState, d.City, d.InvoiceDate?.ToString("yyyy-MM-dd") ?? "", d.InvoiceInfo);
+
+    //记住最近一次提交结果（懒惰清理，避免字典无限增长）
+    private void Remember(string key, string recordId, string billNo, string message)
+    {
+        if (_recentSubmits.Count > 500)
+        {
+            var cutoff = DateTime.UtcNow.AddMinutes(-10);
+            foreach (var stale in _recentSubmits.Where(kv => kv.Value.At < cutoff).Select(kv => kv.Key).ToList())
+                _recentSubmits.TryRemove(stale, out _);
+        }
+        _recentSubmits[key] = (recordId, billNo, message, DateTime.UtcNow);
+    }
+
+    //写入超时后回查：用我们刚生成的「记录提交时间」（毫秒时间戳）精确定位这一行，再用工号二次确认
+    private async Task<string?> TryAdoptAsync(RequestIdentity identity, Dictionary<string, object?> fields,
+        CancellationToken ct)
+    {
+        if (!fields.TryGetValue(InvoicePolicy.FieldSubmittedAt, out var stamp) || stamp is null) return null;
+
+        long want;
+        try { want = Convert.ToInt64(stamp); }
+        catch { return null; }
+
+        try
+        {
+            var items = await _api.ListRecordsAsync(_cfg.Feishu.TableId, 200, ct).ConfigureAwait(false);
+            foreach (var item in items)
+            {
+                var row = ToRow(item);
+                if (!long.TryParse(row.Text(InvoicePolicy.FieldSubmittedAt), out var got) || got != want) continue;
+                if (!string.Equals(row.Text(InvoicePolicy.FieldEmployeeId), identity.User.EmployeeId,
+                        StringComparison.OrdinalIgnoreCase)) continue;
+                return row.RecordId;
+            }
+        }
+        catch
+        {
+            //回查本身失败（飞书仍不可用）→ 视为未命中，交给用户决定是否重提
+        }
+
+        return null;
+    }
+
     private static InvoiceRow ToRow(JsonElement item)    {
         var fields = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
         if (item.TryGetProperty("fields", out var f) && f.ValueKind == JsonValueKind.Object)
@@ -529,7 +682,7 @@ public sealed class InvoiceService
         if (node.ValueKind == JsonValueKind.Object)
         {
             foreach (var p in node.EnumerateObject())
-                result[p.Name] = UnwrapSnapshotValue(p.Value);
+                result[p.Name] = CoerceSnapshotValue(p.Name, p.Value);
         }
         return result;
     }
@@ -540,6 +693,34 @@ public sealed class InvoiceService
         if (v.ValueKind != JsonValueKind.String) return JsonToValue(v);
         var raw = v.GetString() ?? "";
         return TryParseJsonValue(raw) ?? raw;
+    }
+
+    //按字段名还原成飞书可写的真实类型
+    private static object? CoerceSnapshotValue(string name, JsonElement v)
+        => CoerceValueForFeishu(name, UnwrapSnapshotValue(v));
+
+    //金额列是数字、日期列只认毫秒数字，飞书读取时都可能返回字符串
+    private static object? CoerceValueForFeishu(string name, object? value)
+    {
+        if (value is null) return null;
+
+        //金额是数字列：快照里可能是字符串，写回必须是数字
+        if (name == InvoicePolicy.FieldAmount)
+        {
+            if (value is decimal or double or long or int) return value;
+            if (decimal.TryParse(value as string, out var amount)) return amount;
+            return value;
+        }
+
+        //日期列只认毫秒数字
+        if (InvoicePolicy.DateFields.Contains(name))
+        {
+            if (value is long or decimal or int) return value;
+            if (long.TryParse(value as string, out var ms)) return ms;
+            return value;
+        }
+
+        return value;
     }
 
     //日期列不接受空串与 null，其余空串保留（表示清空）

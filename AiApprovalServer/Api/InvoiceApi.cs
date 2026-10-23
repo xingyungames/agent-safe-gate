@@ -1,3 +1,4 @@
+using AiApproval.Ai;
 using AiApproval.Core;
 using AiApproval.Security;
 using AiApproval.Services;
@@ -19,7 +20,7 @@ public static class InvoiceApi
             if (!AccountPolicy.Can(identity.User.Role, Perm.InvoiceSubmit))
                 return Api.Error(403, "FORBIDDEN", "当前角色无权提交报销单");
 
-            if (!guard.TryConsume($"invoice:user:{identity.User.Id}", 30, TimeSpan.FromMinutes(5)))
+            if (!guard.TryConsume($"invoice:user:{identity.User.Id}", 30, TimeSpan.FromMinutes(5), identity.Ip))
                 return Api.Error(429, "RATE_LIMITED", "提交过于频繁，请稍后再试");
 
             var body = Api.ReadBody<InvoiceSubmitRequest>(context);
@@ -173,6 +174,116 @@ public static class InvoiceApi
             return Api.Ok(new { recordId = result.RecordId, message = result.Message });
         });
 
+        //AI 预审评分：只读，只出等级与理由，不改任何单据状态、不写飞书
+        group.MapGet("/ai-scores", async (HttpContext context, InvoiceService invoices, InvoiceAiService ai, bool? refresh) =>
+        {
+            var identity = Api.Identity(context);
+            if (identity is null) return Api.Error(401, "UNAUTHENTICATED", "请先登录");
+            if (!AccountPolicy.Can(identity.User.Role, Perm.InvoiceReview))
+                return Api.Error(403, "FORBIDDEN", "当前角色无权查看 AI 预审结果");
+            if (!ai.Enabled) return Api.Error(400, "AI_DISABLED", "报销 AI 预审未启用");
+
+            var (ok, error, rows) = await invoices.ListAsync(identity, 500).ConfigureAwait(false);
+            if (!ok) return Api.Error(502, "FEISHU_UNAVAILABLE", error);
+
+            var outcome = await ai.ScoreAsync(identity, rows, refresh == true, context.RequestAborted).ConfigureAwait(false);
+            var index = outcome.Scores
+                .GroupBy(s => s.RecordId, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
+
+            return Api.Ok(new
+            {
+                aiAvailable = outcome.AiAvailable,
+                aiError = outcome.AiError,
+                quotaExhausted = outcome.QuotaExhausted,
+                note = "以下等级仅为 AI 与规则的建议，不改变任何单据状态；审批必须由你本人点击执行",
+                stats = new
+                {
+                    total = outcome.Total,
+                    skippedDecided = outcome.SkippedDecided,
+                    skippedCached = outcome.SkippedCached,
+                    scored = outcome.Scored,
+                    ruleOnly = outcome.RuleOnly,
+                    aiFailedBatches = outcome.AiFailedBatches,
+                    injected = outcome.Injected,
+                },
+                rows = rows.Select(row => AiScoreView(row, index.GetValueOrDefault(row.RecordId))).ToList(),
+            });
+        });
+
+        //AI 按需求选单：只出候选清单，绝不执行
+        group.MapPost("/ai-find", async (HttpContext context, InvoiceService invoices, InvoiceAiService ai, SecurityGuard guard) =>
+        {
+            var identity = Api.Identity(context);
+            if (identity is null) return Api.Error(401, "UNAUTHENTICATED", "请先登录");
+            if (!AccountPolicy.Can(identity.User.Role, Perm.InvoiceReview))
+                return Api.Error(403, "FORBIDDEN", "当前角色无权让 AI 选单");
+            if (!AdminWriteAllowed(guard, identity, out var limitMessage))
+                return Api.Error(429, "RATE_LIMITED", limitMessage);
+
+            var body = Api.ReadBody<InvoiceAiFindRequest>(context);
+            if (body is null) return Api.Error(400, "BAD_REQUEST", "请求体格式错误");
+
+            var (ok, error, rows) = await invoices.ListAsync(identity, 500).ConfigureAwait(false);
+            if (!ok) return Api.Error(502, "FEISHU_UNAVAILABLE", error);
+
+            var index = await ai.ScoreIndexAsync(rows, context.RequestAborted).ConfigureAwait(false);
+            var outcome = await ai.FindAsync(identity, rows, index, Api.Clean(body.Requirement, 200),
+                context.RequestAborted).ConfigureAwait(false);
+
+            if (!outcome.Ok) return Api.Error(400, "AI_FIND_FAILED", outcome.Error);
+
+            return Api.Ok(new
+            {
+                action = outcome.Action,
+                note = outcome.Note,
+                message = "以上仅为 AI 给出的候选清单，尚未执行任何操作；确认后请点击按钮批量处理",
+                picked = outcome.Picked.Select(FindItemView).ToList(),
+                dropped = outcome.Dropped.Select(FindItemView).ToList(),
+            });
+        });
+
+        //批量审核：唯一写入口，必须由财务本人点击；逐单复用单条审核逻辑
+        group.MapPost("/batch-review", async (HttpContext context, InvoiceService invoices, SecurityGuard guard) =>
+        {
+            var identity = Api.Identity(context);
+            if (identity is null) return Api.Error(401, "UNAUTHENTICATED", "请先登录");
+            if (!AccountPolicy.Can(identity.User.Role, Perm.InvoiceReview))
+                return Api.Error(403, "FORBIDDEN", "当前角色无权批量审核");
+            if (!AdminWriteAllowed(guard, identity, out var limitMessage))
+                return Api.Error(429, "RATE_LIMITED", limitMessage);
+
+            var body = Api.ReadBody<InvoiceBatchReviewRequest>(context);
+            if (body is null) return Api.Error(400, "BAD_REQUEST", "请求体格式错误");
+
+            var action = Api.Clean(body.Action, 16).ToLowerInvariant();
+            if (action is not ("approve" or "reject"))
+                return Api.Error(400, "BAD_ACTION", "action 只能是 approve（通过）或 reject（打回）");
+
+            var ids = body.RecordIds ?? new List<string>();
+            if (ids.Count == 0) return Api.Error(400, "EMPTY_SELECTION", "请先勾选要处理的单据");
+
+            var newStatus = action == "approve" ? "已通过" : "已驳回";
+            var head = action == "approve" ? "批量审核通过" : "批量审核打回";
+            var extra = Api.Clean(body.Opinion, 200);
+            var opinion = extra.Length == 0 ? head : $"{head}：{extra}";
+            if (opinion.Length > 300) opinion = opinion[..300];
+
+            var result = await invoices.BatchReviewAsync(identity, ids, newStatus, opinion, context.RequestAborted)
+                .ConfigureAwait(false);
+
+            if (result.Error.Length > 0) return Api.Error(400, "BATCH_REJECTED", result.Error);
+
+            return Api.Ok(new
+            {
+                status = newStatus,
+                success = result.Success,
+                failed = result.Failed,
+                message = $"已处理 {result.Items.Count} 单：成功 {result.Success}，失败 {result.Failed}（每单均独立留快照与审计，可单独回退）",
+                items = result.Items.Select(i => new { recordId = i.RecordId, ok = i.Ok, error = i.Error, message = i.Message }).ToList(),
+            });
+        });
+
         //契约元数据
         group.MapGet("/meta", (HttpContext context, AppConfig cfg) =>
         {
@@ -239,11 +350,57 @@ public static class InvoiceApi
         raw = row.Fields.ToDictionary(kv => kv.Key, kv => kv.Value.GetRawText()),
     };
 
-    //后台写操作限流
-    private static bool AdminWriteAllowed(SecurityGuard guard, RequestIdentity identity, out string message)
+    //AI 评分的对外视图（纯只读建议字段）
+    private static object AiScoreView(InvoiceRow row, InvoiceAiScore? score) => new
     {
+        recordId = row.RecordId,
+        billNo = row.Text(InvoicePolicy.FieldBillNo),
+        applicant = row.Text(InvoicePolicy.FieldApplicant),
+        employeeId = row.Text(InvoicePolicy.FieldEmployeeId),
+        department = row.Text(InvoicePolicy.FieldDepartment),
+        rtype = row.Text(InvoicePolicy.FieldType),
+        amount = row.Amount,
+        city = row.Text(InvoicePolicy.FieldCity),
+        hasInvoice = row.Text(InvoicePolicy.FieldInvoiceState),
+        invoiceDate = row.Text(InvoicePolicy.FieldInvoiceDate),
+        reason = row.Text(InvoicePolicy.FieldReason),
+        status = row.Text(InvoicePolicy.FieldStatus),
+        hasScore = score is not null,
+        ruleLevel = score?.RuleLevel ?? 0,
+        aiLevel = score?.AiLevel ?? 0,
+        finalLevel = score?.FinalLevel ?? 0,
+        levelLabel = score is null ? "未评分" : InvoiceAiLevel.Label(score.FinalLevel),
+        levelRisk = score is null ? "" : InvoiceAiLevel.ToRisk(score.FinalLevel),
+        ruleSummary = score?.RuleSummary ?? "",
+        aiReason = score?.AiReason ?? "",
+        suggest = score?.Suggest ?? "",
+        flags = score?.Flags ?? new List<string>(),
+        scoredAt = score?.ScoredAt,
+    };
+
+    //AI 选单条目视图
+    private static object FindItemView(InvoiceAiFindItem item) => new
+    {
+        recordId = item.RecordId,
+        billNo = item.BillNo,
+        summary = item.Summary,
+        reason = item.Reason,
+        level = item.Level,
+        levelLabel = item.Level > 0 ? InvoiceAiLevel.Label(item.Level) : "",
+        status = item.Status,
+        applicant = item.Applicant,
+        amount = item.Amount,
+        rtype = item.Type,
+        department = item.Department,
+        city = item.City,
+        hasInvoice = item.InvoiceState,
+        droppedReason = item.DroppedReason,
+    };
+
+    //后台写操作限流
+    private static bool AdminWriteAllowed(SecurityGuard guard, RequestIdentity identity, out string message)    {
         message = "";
-        if (guard.TryConsume($"invoicewrite:{identity.User.Id}", guard.AdminWritePerMinute, TimeSpan.FromMinutes(1))) return true;
+        if (guard.TryConsume($"invoicewrite:{identity.User.Id}", guard.AdminWritePerMinute, TimeSpan.FromMinutes(1), identity.Ip)) return true;
         message = "操作过于频繁，请稍后再试";
         return false;
     }
@@ -288,4 +445,18 @@ public sealed class InvoiceRollbackRequest
 {
     public string VersionId { get; set; } = "";
     public string TaskId { get; set; } = "";
+}
+
+//AI 选单请求
+public sealed class InvoiceAiFindRequest
+{
+    public string Requirement { get; set; } = "";
+}
+
+//批量审核请求：只能由财务本人点击提交
+public sealed class InvoiceBatchReviewRequest
+{
+    public List<string>? RecordIds { get; set; }
+    public string Action { get; set; } = "";
+    public string Opinion { get; set; } = "";
 }

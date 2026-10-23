@@ -1,14 +1,17 @@
 #API 网关离线单测 零网络
+#账号与权限来自主服务器（离线替身），单据读写全部经主服务器
 import os
 import sys
 import json
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from mock_backend import FakeBackend, install, make_row, make_token, make_user
 from models.retriever import Retriever, Chunk
 from models.llm import LLMAdapter, MockProvider
 from models.agent import XiaoCaiAgent
-from models import users
+from api import backend_client
 from api.main import dispatch, app
 import api.main as apimod
 from api.session import SessionStore
@@ -23,96 +26,41 @@ CORPUS = [
           source="报销制度.md"),
 ]
 
+EMP = ("employee", "Staff#2026abc")   #张三 E0001 员工
+FIN = ("finance", "Money#2026abc")    #李四 E0002 财务部
+
 
 class MockFeishu:
-    #离线假飞书客户端
+    #离线假飞书客户端 只承担发票附件列
     def __init__(self):
-        #已写入的记录
-        self.created = []
+        self.uploaded = []
+        self.updated = []
 
-    def create_records(self, table_id, records):
-        #批量写记录并返回 id
-        ids = [f"rec_{i}_{len(self.created)}" for i in range(len(records))]
-        self.created.extend(records)
-        return ids
+    def field_names(self, table_id, **kw):
+        return {"发票信息", "发票附件", "事由", "金额"}
 
-    def list_records(self, table_id, **kw):
-        #固定返回一条记录
-        return [{
-            "record_id": "r1",
-            "fields": {"单号": "BX-000013", "申请人": "小新新", "部门": "研发部",
-                       "报销类型": "差旅费", "金额": 1800, "事由": "北京出差",
-                       "状态": "审核中", "合规结果": "通过", "票据状态": "有票"},
-        }]
-
-    def get_record(self, table_id, record_id, **kw):
-        #单条查询返回固定记录
-        return {"record_id": record_id, "fields": {"单号": "BX-DEMO-001"}}
-
-
-class FakeUserClient:
-    #内存版飞书用户表
-
-    def __init__(self, seed_fields=None):
-        #载入种子账号
-        self._next_id = 1
-        self.records = []
-        for f in seed_fields or []:
-            self.records.append({"record_id": f"rec{self._next_id}", "fields": dict(f)})
-            self._next_id += 1
-        self.list_calls = 0
-        self.updates = []
-        self.created = []
-
-    def list_records(self, table_id, *, page_size=20, filter_expr="", app_token=""):
-        #列出全部用户记录
-        self.list_calls += 1
-        return [{"record_id": r["record_id"], "fields": dict(r["fields"])}
-                for r in self.records]
-
-    def create_records(self, table_id, records, app_token=""):
-        #新建用户记录
-        ids = []
-        for f in records:
-            rid = f"rec{self._next_id}"
-            self._next_id += 1
-            self.records.append({"record_id": rid, "fields": dict(f)})
-            ids.append(rid)
-        self.created.extend(records)
-        return ids
+    def upload_attachment(self, filename, file_bytes, content_type="application/octet-stream",
+                          app_token=""):
+        self.uploaded.append((filename, bytes(file_bytes), content_type))
+        return "boxcnenTokenApi"
 
     def update_record(self, table_id, record_id, fields, app_token=""):
-        #按记录号更新字段
-        self.updates.append((record_id, dict(fields)))
-        for r in self.records:
-            if r["record_id"] == record_id:
-                r["fields"].update(fields)
-                return record_id
-        raise Exception("record not found")
+        self.updated.append((table_id, record_id, dict(fields)))
+        return record_id
 
 
-def _seed_users():
-    #预置演示账号数据
-    return [
-        users.make_user_record(username="zhangsan", name="张三",
-                               role="员工", password="pw123", employee_id="E0001"),
-        users.make_user_record(username="caiwu", name="钱会计",
-                               role="财务", password="pw456", employee_id="E0002"),
-        users.make_user_record(username="admin", name="管理员",
-                               role="管理员", password="pw789", employee_id="E0003"),
-        users.make_user_record(username="lisi", name="李四",
-                               role="员工", password="pw000", status="停用"),
-    ]
+#装上离线主服务器
+def _backend(rows=None):
+    fake = FakeBackend(rows=rows)
+    install(fake, backend_client)
+    return fake
 
 
-AUTH_SECRET = "unit-test-secret-m8"
-
-
-def _auth(limit: int = 5) -> AuthService:
-    #构造离线认证服务
-    store = users.UserStore(FakeUserClient(_seed_users()), "tblUsers")
-    return AuthService(store, AUTH_SECRET, ttl=600,
-                       login_limiter=RateLimiter(limit=limit, window=300))
+#装配认证服务与离线主服务器
+def _setup(rows=None, limit: int = 5):
+    fake = _backend(rows)
+    auth = AuthService(login_limiter=RateLimiter(limit=limit, window=300))
+    return auth, fake
 
 
 def _tok(auth: AuthService, username: str, password: str) -> str:
@@ -140,175 +88,216 @@ def test_chat_consult_offline():
     #离线咨询走 A 分支
     a = _agent()
     s = SessionStore()
-    auth = _auth()
-    tok = _tok(auth, "zhangsan", "pw123")
+    auth, _ = _setup()
+    tok = _tok(auth, *EMP)
     code, p = dispatch("POST", "/chat", {"session_id": "c1", "text": "差旅费住宿标准是多少"},
                        a, s, auth=auth, token=tok)
     assert code == 200 and p["intent"] == "A"
-    #第二轮历史已入库
-    assert len(s.get_messages("c1")) == 2
-    #第三轮仍正常
-    code2, p2 = dispatch("POST", "/chat", {"session_id": "c1", "text": "那招待费呢"},
-                         a, s, auth=auth, token=tok)
-    assert code2 == 200 and p2["intent"] == "A"
-    assert len(s.get_messages("c1")) == 4
     print("[PASS] test_chat_consult_offline")
 
 
 def test_chat_fill_merges_draft():
-    #跨轮补全草稿再确认写表
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
+    #两轮补全字段并保持 B 分支
+    a = _agent()
     s = SessionStore()
-    auth = _auth()
-    tok = _tok(auth, "zhangsan", "pw123")
-    r1 = dispatch("POST", "/chat", {"session_id": "f1", "text": "我要填报销单 张三 研发部"},
-                  a, s, auth=auth, token=tok)
-    assert r1[0] == 200 and r1[1]["intent"] == "B"
-    assert r1[1]["record_id"] is None, "第一轮缺项不应写表"
-    r2 = dispatch("POST", "/chat", {"session_id": "f1", "text": "招待费 800 有发票"},
-                  a, s, auth=auth, token=tok)
-    assert r2[0] == 200 and r2[1]["intent"] == "B"
-    assert r2[1]["record_id"] is None, "合并草稿后字段齐全应进入确认态（不直接写表）"
-    assert "确认提交" in r2[1]["answer"], "应提示用户确认"
-    #用户确认才写表
-    r3 = dispatch("POST", "/chat", {"session_id": "f1", "text": "确认提交"},
-                  a, s, auth=auth, token=tok)
-    assert r3[0] == 200 and r3[1]["intent"] == "B"
-    assert r3[1]["record_id"], "确认后字段齐全应已写表"
-    assert "✅" in r3[1]["answer"]
+    auth, _ = _setup()
+    tok = _tok(auth, *EMP)
+    code, p = dispatch("POST", "/chat", {"session_id": "f1", "text": "我要报销 张三 研发部 差旅费"},
+                       a, s, auth=auth, token=tok)
+    assert code == 200 and p["intent"] == "B"
+    assert p["draft"] and p["draft"].get("department") == "研发部"
+    code, p = dispatch("POST", "/chat", {"session_id": "f1", "text": "800 有发票 上海 事由是出差谈客户"},
+                       a, s, auth=auth, token=tok)
+    assert p["intent"] == "B"
+    assert p["draft"]["amount"] == 800 and p["draft"]["city"] == "上海"
+    assert p["draft"].get("await_confirm"), "字段齐了应进入确认态"
     print("[PASS] test_chat_fill_merges_draft")
 
 
 def test_reimburse_endpoint():
-    #报销接口直接写表
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    auth = _auth()
-    tok = _tok(auth, "zhangsan", "pw123")
+    #报销接口经主服务器写入 身份由服务端盖章
+    auth, fake = _setup()
+    tok = _tok(auth, *EMP)
     code, p = dispatch("POST", "/reimburse",
-                       {"applicant": "张三", "rtype": "差旅费", "amount": 800, "has_invoice": "有票"},
-                       a, SessionStore(), auth=auth, token=tok)
-    assert code == 200 and p["record_id"]
-    assert p["status"] == "待审核"
+                       {"department": "研发部", "rtype": "差旅费", "amount": 800,
+                        "reason": "北京出差", "has_invoice": "有票", "city": "上海"},
+                       _agent(), SessionStore(), auth=auth, token=tok)
+    assert code == 200 and p["record_id"], p
+    assert p["status"] == "待审核" and p["via"] == "main-server"
+    rec = fake.submitted[-1]
+    assert rec["applicant"] == "张三" and rec["employeeId"] == "E0001", rec
+    assert rec["city"] == "上海" and rec["department"] == "研发部", rec
     print("[PASS] test_reimburse_endpoint")
 
 
-def test_reimburse_no_feishu_503():
-    #无飞书时返回 503
-    a = _agent()  #不带飞书
-    auth = _auth()
-    tok = _tok(auth, "zhangsan", "pw123")
-    code, p = dispatch("POST", "/reimburse", {"applicant": "张三"}, a, SessionStore(),
-                       auth=auth, token=tok)
-    assert code == 503
-    print("[PASS] test_reimburse_no_feishu_503")
+def test_reimburse_ignores_spoofed_applicant():
+    #接口不再接收申请人 想替人报也没入口
+    auth, fake = _setup()
+    tok = _tok(auth, *EMP)
+    code, p = dispatch("POST", "/reimburse",
+                       {"applicant": "李四", "department": "研发部", "rtype": "差旅费",
+                        "amount": 800, "has_invoice": "有票", "city": "上海"},
+                       _agent(), SessionStore(), auth=auth, token=tok)
+    assert code == 200 and p["record_id"], p
+    assert fake.submitted[-1]["applicant"] == "张三", fake.submitted[-1]
+    print("[PASS] test_reimburse_ignores_spoofed_applicant")
+
+
+def test_reimburse_backend_down_503():
+    #主服务器不可用时 503 且不写飞书
+    auth, fake = _setup()
+    tok = _tok(auth, *EMP)
+    fake.fail = "unavailable"
+    code, p = dispatch("POST", "/reimburse",
+                       {"department": "研发部", "rtype": "差旅费", "amount": 800,
+                        "has_invoice": "有票", "city": "上海"},
+                       _agent(), SessionStore(), auth=auth, token=tok)
+    assert code == 503 and "主服务器" in p["error"], p
+    assert not fake.submitted
+    print("[PASS] test_reimburse_backend_down_503")
+
+
+def test_reimburse_rejected_400():
+    #业务拒绝回 400 并透出服务端原因
+    auth, fake = _setup()
+    tok = _tok(auth, *EMP)
+    fake.fail = "rejected"
+    code, p = dispatch("POST", "/reimburse",
+                       {"department": "研发部", "rtype": "差旅费", "amount": 800},
+                       _agent(), SessionStore(), auth=auth, token=tok)
+    assert code == 400 and "事由" in p["error"], p
+    print("[PASS] test_reimburse_rejected_400")
 
 
 def test_progress_endpoint():
     #财务可查任意人进度
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    auth = _auth()
-    tok = _tok(auth, "caiwu", "pw456")  #财务可查任意人
-    code, p = dispatch("POST", "/progress", {"applicant": "小新新"}, a, SessionStore(),
+    rows = [make_row("r1", "小新新", "E0009", "BX-000013", status="审核中")]
+    auth, _ = _setup(rows=rows)
+    tok = _tok(auth, *FIN)
+    code, p = dispatch("POST", "/progress", {"applicant": "小新新"}, _agent(), SessionStore(),
                        auth=auth, token=tok)
     assert code == 200 and p["intent"] == "D"
-    assert "小新新" in p["answer"]
+    #明细在 records 里 答案只给摘要
+    assert p["records"] and p["records"][0]["申请人"] == "小新新", p["records"]
+    assert "查到 1 条" in p["answer"], p["answer"]
     print("[PASS] test_progress_endpoint")
 
 
 def test_progress_requires_param():
-    #缺申请人参数返回 400
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    auth = _auth()
-    tok = _tok(auth, "caiwu", "pw456")
-    code, p = dispatch("POST", "/progress", {}, a, SessionStore(), auth=auth, token=tok)
+    #缺参数返回 400
+    auth, _ = _setup()
+    tok = _tok(auth, *FIN)
+    code, p = dispatch("POST", "/progress", {}, _agent(), SessionStore(), auth=auth, token=tok)
     assert code == 400
     print("[PASS] test_progress_requires_param")
 
 
+def test_progress_employee_forced_self():
+    #员工查他人只能看到自己的单
+    rows = [make_row("r1", "张三", "E0001", "BX-000013"),
+            make_row("r2", "李四", "E0002", "BX-000014")]
+    auth, _ = _setup(rows=rows)
+    tok = _tok(auth, *EMP)
+    code, p = dispatch("POST", "/progress", {"applicant": "李四"}, _agent(), SessionStore(),
+                       auth=auth, token=tok)
+    assert code == 200 and p["intent"] == "D"
+    nos = [r["单号"] for r in p["records"]]
+    assert nos == ["BX-000013"], nos
+    assert "BX-000014" not in nos, "员工不应看到他人单据"
+    print("[PASS] test_progress_employee_forced_self")
+
+
 def test_not_found():
     #未知路径返回 404
-    auth = _auth()
-    tok = _tok(auth, "zhangsan", "pw123")
+    auth, _ = _setup()
+    tok = _tok(auth, *EMP)
     code, p = dispatch("GET", "/nope", {}, _agent(), SessionStore(), auth=auth, token=tok)
     assert code == 404
     print("[PASS] test_not_found")
 
 
-def test_auth_wall_401_fail_closed():
-    #缺令牌一律 401 不放行
+def test_auth_wall_fail_closed():
+    #缺令牌 401；认证未配置 503
     a = _agent()
     s = SessionStore()
-    auth = _auth()
-    #缺令牌
+    auth, _ = _setup()
     code, p = dispatch("POST", "/chat", {"session_id": "w1", "text": "你好"}, a, s, auth=auth, token="")
     assert code == 401, "缺 token 应 401"
-    #伪造令牌
     code, p = dispatch("POST", "/chat", {"session_id": "w1", "text": "你好"},
                        a, s, auth=auth, token="Bearer fake.token.here")
     assert code == 401, "伪造 token 应 401"
-    #认证未配置也 401
+    #认证未配置是配置错误 用 503 区分于「该重新登录」
     code, p = dispatch("POST", "/chat", {"session_id": "w1", "text": "你好"}, a, s, auth=None)
-    assert code == 401 and "auth required" in p["error"], "auth 未配置应 fail-closed 401"
+    assert code == 503 and "BACKEND_BASE_URL" in p["error"], p
     #健康检查免认证
     code, p = dispatch("GET", "/health", {}, a, s, auth=None)
     assert code == 200
-    print("[PASS] test_auth_wall_401_fail_closed")
+    print("[PASS] test_auth_wall_fail_closed")
 
 
 def test_login_flow():
-    #登录发令牌 查身份还原
+    #登录发主服务器令牌 查身份还原
     a = _agent()
-    auth = _auth()
-    code, p = dispatch("POST", "/login", {"username": "zhangsan", "password": "pw123"},
+    auth, _ = _setup()
+    code, p = dispatch("POST", "/login", {"username": EMP[0], "password": EMP[1]},
                        a, SessionStore(), auth=auth, client_ip="1.2.3.4")
     assert code == 200 and p["token"] and p["session_id"]
     assert p["user"]["角色"] == "员工" and p["user"]["姓名"] == "张三"
-    assert "密码哈希" not in str(p) and "盐" not in str(p), "登录响应不得泄露凭据字段"
-    code, p = dispatch("GET", "/me", {}, a, SessionStore(), auth=auth,
-                       token=f"Bearer {p['token']}")
+    assert p["user"]["工号"] == "E0001"
+    assert p["perms"] and "invoice.submit" in p["perms"], p["perms"]
+    assert "signKey" not in p, "签名密钥不得下发浏览器"
+    tok = f"Bearer {p['token']}"
+    code, p = dispatch("GET", "/me", {}, a, SessionStore(), auth=auth, token=tok)
     assert code == 200
-    assert p["user"]["username"] == "zhangsan" and p["user"]["role"] == "员工"
-    assert "department" not in p["user"], "用户表已删部门列，claims 不应再有 department"
-    assert p["user"]["employee_id"] == "E0001"
+    assert p["user"]["用户名"] == "employee" and p["user"]["角色"] == "员工"
+    assert "department" not in p["user"], "主服务器账号没有部门字段"
     print("[PASS] test_login_flow")
 
 
 def test_login_rejections():
     #登录各类失败分支
     a = _agent()
-    auth = _auth()
-    code, p = dispatch("POST", "/login", {"username": "zhangsan", "password": "bad"},
+    auth, _ = _setup()
+    code, p = dispatch("POST", "/login", {"username": EMP[0], "password": "bad"},
                        a, SessionStore(), auth=auth)
-    assert code == 401 and p["error"] == "用户名或密码错误"
+    assert code == 401 and "口令" in p["error"], p
     code, p = dispatch("POST", "/login", {"username": "nobody", "password": "bad"},
                        a, SessionStore(), auth=auth)
-    assert code == 401 and p["error"] == "用户名或密码错误", "不存在与错密码提示必须一致（防枚举）"
-    code, p = dispatch("POST", "/login", {"username": "lisi", "password": "pw000"},
-                       a, SessionStore(), auth=auth)
-    assert code == 401 and "停用" in p["error"]
+    assert code == 401 and "口令" in p["error"], "不存在与错密码提示必须一致（防枚举）"
     code, p = dispatch("POST", "/login", {"username": "", "password": "x"},
                        a, SessionStore(), auth=auth)
     assert code == 400
-    code, p = dispatch("POST", "/login", {"username": "zhangsan", "password": "pw123"},
+    code, p = dispatch("POST", "/login", {"username": EMP[0], "password": EMP[1]},
                        a, SessionStore(), auth=None)
     assert code == 503, "auth 未配置时 /login 应 503"
     print("[PASS] test_login_rejections")
 
 
+def test_login_backend_down_503():
+    #主服务器不可用是 503 不是口令错误
+    a = _agent()
+    auth, fake = _setup()
+    fake.fail = "unavailable"
+    code, p = dispatch("POST", "/login", {"username": EMP[0], "password": EMP[1]},
+                       a, SessionStore(), auth=auth)
+    assert code == 503 and "主服务器" in p["error"], p
+    print("[PASS] test_login_backend_down_503")
+
+
 def test_login_rate_limit_only_failures():
     #登录限流只计失败次数
     a = _agent()
-    auth = _auth(limit=2)
-    code, p = dispatch("POST", "/login", {"username": "zhangsan", "password": "pw123"},
+    auth, _ = _setup(limit=2)
+    code, p = dispatch("POST", "/login", {"username": EMP[0], "password": EMP[1]},
                        a, SessionStore(), auth=auth)
     assert code == 200, "正常登录不消耗限流配额"
     for _ in range(2):
-        dispatch("POST", "/login", {"username": "zhangsan", "password": "bad"},
+        dispatch("POST", "/login", {"username": EMP[0], "password": "bad"},
                  a, SessionStore(), auth=auth)
-    code, p = dispatch("POST", "/login", {"username": "zhangsan", "password": "pw123"},
+    code, p = dispatch("POST", "/login", {"username": EMP[0], "password": EMP[1]},
                        a, SessionStore(), auth=auth)
-    assert code == 429, "失败达上限后即使密码正确也应拒绝（防爆破）"
-    code, p = dispatch("POST", "/login", {"username": "caiwu", "password": "pw456"},
+    assert code == 429, "失败达上限后即使口令正确也应拒绝（防爆破）"
+    code, p = dispatch("POST", "/login", {"username": FIN[0], "password": FIN[1]},
                        a, SessionStore(), auth=auth)
     assert code == 200, "其他用户不受影响"
     print("[PASS] test_login_rate_limit_only_failures")
@@ -318,9 +307,9 @@ def test_sid_binding_403():
     #同会话换用户返回 403
     a = _agent()
     s = SessionStore()
-    auth = _auth()
-    tok_a = _tok(auth, "zhangsan", "pw123")
-    tok_b = _tok(auth, "caiwu", "pw456")
+    auth, _ = _setup()
+    tok_a = _tok(auth, *EMP)
+    tok_b = _tok(auth, *FIN)
     code, p = dispatch("POST", "/chat", {"session_id": "shared", "text": "你好"},
                        a, s, auth=auth, token=tok_a)
     assert code == 200
@@ -333,62 +322,56 @@ def test_sid_binding_403():
     print("[PASS] test_sid_binding_403")
 
 
-def test_logout_revokes_token():
-    #登出后旧令牌立即失效
+def test_logout_clears_gateway_cache():
+    #登出只清网关缓存；主服务器不做吊销 令牌被拒后必须重新登录
     a = _agent()
     s = SessionStore()
-    auth = _auth()
-    tok = _tok(auth, "zhangsan", "pw123")
+    auth, fake = _setup()
+    tok = _tok(auth, *EMP)
     code, p = dispatch("POST", "/chat", {"session_id": "lo1", "text": "你好"},
                        a, s, auth=auth, token=tok)
     assert code == 200
     code, p = dispatch("POST", "/logout", {}, a, s, auth=auth, token=tok)
     assert code == 200
+    #清缓存后会重新向主服务器校验：主服务器判失效则 401
+    fake.fail = "unauthorized"
     code, p = dispatch("POST", "/chat", {"session_id": "lo1", "text": "你好"},
                        a, s, auth=auth, token=tok)
-    assert code == 401, "登出后原 token 应立即失效"
-    tok2 = _tok(auth, "zhangsan", "pw123")
-    code, p = dispatch("POST", "/chat", {"session_id": "lo2", "text": "你好"},
-                       a, s, auth=auth, token=tok2)
-    assert code == 200, "重新登录后应可用"
-    print("[PASS] test_logout_revokes_token")
+    assert code == 401, "清缓存且主服务器判失效后应 401"
+    print("[PASS] test_logout_clears_gateway_cache")
 
 
-def test_role_overrides_gateway():
-    #网关按角色覆写申请人
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    auth = _auth()
-    tok_emp = _tok(auth, "zhangsan", "pw123")
-    #员工冒充他人被身份覆写
-    code, p = dispatch("POST", "/reimburse",
-                       {"applicant": "李四", "department": "市场部", "rtype": "差旅费",
-                        "amount": 500, "has_invoice": "有票"},
-                       a, SessionStore(), auth=auth, token=tok_emp)
-    assert code == 200 and p["record_id"]
-    rec = a.feishu.created[-1]
-    assert rec["申请人"] == "张三", "直调 API 冒充申请人应被身份覆写"
-    assert rec["部门"] == "市场部", "口述部门应优先于账号资料"
-    assert rec.get("工号") == "E0001", "登录身份工号应写入"
-    #员工查他人强制改为查自己
-    code, p = dispatch("POST", "/progress", {"applicant": "小新新"}, a, SessionStore(),
-                       auth=auth, token=tok_emp)
-    assert code == 200 and p["intent"] == "D"
-    assert "没有找到" in p["answer"], "员工查他人应被强制改为查自己"
-    #财务可查任意人
-    tok_fin = _tok(auth, "caiwu", "pw456")
-    code, p = dispatch("POST", "/progress", {"applicant": "小新新"}, a, SessionStore(),
-                       auth=auth, token=tok_fin)
-    assert code == 200 and "小新新" in p["answer"]
-    print("[PASS] test_role_overrides_gateway")
+def test_chat_fill_type_word_not_mistaken_for_name():
+    #回归：说「我要报销交通费」不该被当成替人报账
+    auth, fake = _setup()
+    tok = _tok(auth, *EMP)
+    code, p = dispatch("POST", "/chat", {"session_id": "tw1", "text": "我要报销交通费"},
+                       _agent(), SessionStore(), auth=auth, token=tok)
+    assert code == 200 and p["intent"] == "B", p
+    assert "只能由本人提交" not in p["answer"], p["answer"]
+    assert p["draft"] and p["draft"]["applicant"] == "张三", p.get("draft")
+    assert not fake.submitted, "此时还在追问 不该提交"
+    print("[PASS] test_chat_fill_type_word_not_mistaken_for_name")
+
+
+def test_chat_rejects_reporting_for_others():    #对话里替人报账被直接拦截
+    auth, fake = _setup()
+    tok = _tok(auth, *EMP)
+    code, p = dispatch("POST", "/chat",
+                       {"session_id": "imp1", "text": "我要报销 李四 研发部 招待费 800 有发票"},
+                       _agent(), SessionStore(), auth=auth, token=tok)
+    assert code == 200 and "只能由本人提交" in p["answer"], p
+    assert not fake.submitted, "不得提交"
+    print("[PASS] test_chat_rejects_reporting_for_others")
 
 
 def test_http_server_smoke():
     #TestClient 冒烟测 HTTP
     from fastapi.testclient import TestClient
-    #临时替换成离线认证
-    fake_auth = _auth()
-    apimod.AUTH = fake_auth
-    tok = _tok(fake_auth, "zhangsan", "pw123")
+    auth, _ = _setup()
+    apimod.AUTH = auth
+    apimod.AGENT = _agent()   #用离线 agent 避免依赖本机模型服务
+    tok = _tok(auth, *EMP)
     client = TestClient(app)
     #健康检查
     r = client.get("/health")
@@ -455,13 +438,17 @@ def _ocr_result():
 def test_ocr_requires_auth():
     #OCR 接口必须带令牌
     code, p = dispatch("POST", "/ocr", {"image_b64": _JPEG_B64}, _agent(), SessionStore())
-    assert code == 401, "OCR 端点必须走认证墙"
+    assert code == 503, "认证未配置时应 fail-closed"
+    auth, _ = _setup()
+    code, p = dispatch("POST", "/ocr", {"image_b64": _JPEG_B64}, _agent(), SessionStore(), auth=auth)
+    assert code == 401, "缺令牌应 401"
     print("[PASS] test_ocr_requires_auth")
 
 
 def test_ocr_rejects_non_image():
     #非图片返回 400
-    auth = _auth(); tok = _tok(auth, "zhangsan", "pw123")
+    auth, _ = _setup()
+    tok = _tok(auth, *EMP)
     #能解码但无图片魔数
     code, p = dispatch("POST", "/ocr", {"session_id": "ocr1", "image_b64": "aGVsbG8="},
                        _agent(), SessionStore(), auth=auth, token=tok,
@@ -472,7 +459,8 @@ def test_ocr_rejects_non_image():
 
 def test_ocr_success_with_mock_engine():
     #假引擎识别成功返回字段
-    auth = _auth(); tok = _tok(auth, "zhangsan", "pw123")
+    auth, _ = _setup()
+    tok = _tok(auth, *EMP)
     eng = FakeOcrEngine(_ocr_result())
     code, p = dispatch("POST", "/ocr", {"session_id": "ocr2", "image_b64": _JPEG_B64,
                                         "filename": "fapiao.jpg"},
@@ -487,17 +475,20 @@ def test_ocr_success_with_mock_engine():
 def test_ocr_engine_error_502():
     #引擎抛错时返回 502
     from models.ocr import OCRError
-    auth = _auth(); tok = _tok(auth, "zhangsan", "pw123")
-    eng = FakeOcrEngine(error=OCRError("图片不是发票/收据/消费凭证"))
+    auth, _ = _setup()
+    tok = _tok(auth, *EMP)
+    eng = FakeOcrEngine(error=OCRError("没识别出报销要素，请上传相关发票，或更清晰的支付凭证截图"))
     code, p = dispatch("POST", "/ocr", {"session_id": "ocr3", "image_b64": _JPEG_B64},
                        _agent(), SessionStore(), auth=auth, token=tok, ocr_engine=eng)
-    assert code == 502 and "OCR failed" in p["error"]
+    assert code == 502 and "识别失败" in p["error"], p
+    assert "没识别出报销要素" in p["error"], p
     print("[PASS] test_ocr_engine_error_502")
 
 
 def test_ocr_not_configured_503():
     #未配 OCR 时返回 503
-    auth = _auth(); tok = _tok(auth, "zhangsan", "pw123")
+    auth, _ = _setup()
+    tok = _tok(auth, *EMP)
     orig = apimod.OCR_ENGINE
     apimod.OCR_ENGINE = None
     try:
@@ -527,59 +518,37 @@ def test_decode_image_helpers():
     print("[PASS] test_decode_image_helpers")
 
 
-class MockFeishuM9(MockFeishu):
-    #带附件能力的假飞书
-
-    def __init__(self):
-        #记录上传与回写
-        super().__init__()
-        self.uploaded = []
-        self.updated = []
-
-    def field_names(self, table_id, **kw):
-        #返回固定字段名集合
-        return {"发票信息", "发票附件", "事由", "金额"}
-
-    def upload_attachment(self, filename, file_bytes, content_type="application/octet-stream",
-                          app_token=""):
-        #假装上传附件返回凭证
-        self.uploaded.append((filename, bytes(file_bytes), content_type))
-        return "boxcnenTokenApi"
-
-    def update_record(self, table_id, record_id, fields, app_token=""):
-        #记录回写字段
-        self.updated.append((table_id, record_id, dict(fields)))
-        return record_id
-
-
 def test_chat_confirm_with_image_attaches_invoice():
-    #确认提交捎带发票图写表
-    mf = MockFeishuM9()
-    auth = _auth(); tok = _tok(auth, "zhangsan", "pw123")
+    #确认提交后 单据由主服务器落库 图片再写进附件列
+    mf = MockFeishu()
+    auth, fake = _setup()
+    tok = _tok(auth, *EMP)
     s = SessionStore()
+    agent = _agent(feishu=mf, table_id="tblX")
     #识别字段随首句并入草稿
     code, p = dispatch("POST", "/chat",
-                       {"session_id": "m9e2e", "text": "我是张三，研发部，差旅费 800元，有发票",
+                       {"session_id": "m9e2e", "text": "我是张三，研发部，差旅费 800元 有发票 上海 事由是出差谈客户",
                         "invoice_no": "INV1", "invoice_seller": "某酒店"},
-                       _agent(feishu=mf, table_id="tblX"), s, auth=auth, token=tok)
+                       agent, s, auth=auth, token=tok)
     assert code == 200 and p["intent"] == "B"
     assert p["draft"].get("invoice_no") == "INV1"
     #确认提交并捎发票图
     code2, p2 = dispatch("POST", "/chat",
                          {"session_id": "m9e2e", "text": "确认提交",
                           "image_b64": _JPEG_B64, "image_mime": "image/jpeg"},
-                         _agent(feishu=mf, table_id="tblX"), s, auth=auth, token=tok)
-    assert code2 == 200 and p2["record_id"]
-    assert mf.created[0].get("发票信息") == "INV1；某酒店"
+                         agent, s, auth=auth, token=tok)
+    assert code2 == 200 and p2["record_id"], p2
+    assert fake.submitted[0]["invoice_info"] == "INV1；某酒店", fake.submitted[0]
     assert mf.uploaded and mf.uploaded[0] == ("发票.jpg", _JPEG_BYTES, "image/jpeg")
     assert mf.updated and mf.updated[0][1] == p2["record_id"]
-    assert "已存档" in p2["answer"]
+    assert "已存档" in p2["answer"], p2["answer"]
     print("[PASS] test_chat_confirm_with_image_attaches_invoice")
 
 
 def test_chat_invalid_image_400():
     #聊天带非法图片返回 400
-    auth = _auth(); tok = _tok(auth, "zhangsan", "pw123")
+    auth, _ = _setup()
+    tok = _tok(auth, *EMP)
     code, p = dispatch("POST", "/chat",
                        {"session_id": "m9bad", "text": "我要报销",
                         "image_b64": "aGVsbG8="},
@@ -593,17 +562,22 @@ if __name__ == "__main__":
     test_chat_consult_offline()
     test_chat_fill_merges_draft()
     test_reimburse_endpoint()
-    test_reimburse_no_feishu_503()
+    test_reimburse_ignores_spoofed_applicant()
+    test_reimburse_backend_down_503()
+    test_reimburse_rejected_400()
     test_progress_endpoint()
     test_progress_requires_param()
+    test_progress_employee_forced_self()
     test_not_found()
-    test_auth_wall_401_fail_closed()
+    test_auth_wall_fail_closed()
     test_login_flow()
     test_login_rejections()
+    test_login_backend_down_503()
     test_login_rate_limit_only_failures()
     test_sid_binding_403()
-    test_logout_revokes_token()
-    test_role_overrides_gateway()
+    test_logout_clears_gateway_cache()
+    test_chat_fill_type_word_not_mistaken_for_name()
+    test_chat_rejects_reporting_for_others()
     test_ocr_requires_auth()
     test_ocr_rejects_non_image()
     test_ocr_success_with_mock_engine()

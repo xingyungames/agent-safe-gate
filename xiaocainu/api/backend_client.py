@@ -1,70 +1,65 @@
-#主服务器适配器 报销单写入口
+#主服务器适配器 无状态：令牌由浏览器持有 这里只负责转发与签名
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
-import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
-from typing import Dict, Optional, Tuple
-
-#令牌提前 60 秒重换
-_TOKEN_MARGIN = 60
+from typing import Optional, Tuple
 
 
-#主服务器错误基类
+#主服务器错误基类 带状态码与业务码 供网关精确映射
 class BackendError(Exception):
-    """主服务器调用失败。"""
+    def __init__(self, message: str, status: int = 0, code: str = ""):
+        super().__init__(message)
+        self.status = int(status or 0)
+        self.code = code or ""
 
 
-#主服务器不可用
+#连不上或主服务器自身故障
 class BackendUnavailable(BackendError):
-    """连不上主服务器。"""
+    pass
 
 
-#主服务器拒绝写入
+#主服务器明确拒绝本次请求（业务结论，不许绕过）
 class BackendRejected(BackendError):
-    """主服务器拒绝了本次写入。"""
+    pass
 
 
-def mode() -> str:
-    #当前后端模式
-    if not base_url():
-        return "off"
-    raw = (os.getenv("BACKEND_MODE", "preferred") or "preferred").strip().lower()
-    return raw if raw in ("off", "preferred", "required") else "preferred"
+#令牌无效或已过期 需要重新登录
+class BackendUnauthorized(BackendError):
+    pass
 
 
+#主服务器地址 为空即未启用
 def base_url() -> str:
-    #主服务器地址
     return (os.getenv("BACKEND_BASE_URL", "") or "").strip().rstrip("/")
 
 
+#是否已配置主服务器
 def enabled() -> bool:
-    #是否启用主服务器
-    return mode() != "off"
+    return bool(base_url())
 
 
 def _timeout() -> int:
-    #单次请求超时秒数
     try:
-        return max(1, int(os.getenv("BACKEND_TIMEOUT", "15")))
+        return max(1, int(os.getenv("BACKEND_TIMEOUT", "20")))
     except ValueError:
-        return 15
+        return 20
 
 
-def _sign(method: str, path_with_query: str, body_text: str, sign_key: str) -> Dict[str, str]:
-    #按约定生成 HMAC 签名头
+#按约定生成 HMAC 签名头 每次调用都换新的时间戳与随机数
+def _sign(method: str, path_with_query: str, body_text: str, sign_key: str) -> dict:
     ts = str(int(time.time() * 1000))
     nonce = hashlib.sha256(os.urandom(16)).hexdigest()[:36]
     body_hash = hashlib.sha256((body_text or "").encode("utf-8")).hexdigest()
     canonical = "\n".join([method.upper(), path_with_query, ts, nonce, body_hash])
     sig = hmac.new(sign_key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).digest()
-    import base64
     return {
         "X-Timestamp": ts,
         "X-Nonce": nonce,
@@ -72,9 +67,12 @@ def _sign(method: str, path_with_query: str, body_text: str, sign_key: str) -> D
     }
 
 
+#发一次请求 返回状态与 JSON
 def _request(method: str, path: str, *, body: Optional[dict] = None,
-             token: str = "", sign_key: str = "") -> Tuple[int, dict]:
-    #发一次请求 返回状态与 JSON
+             token: str = "", sign_key: str = "",
+             extra_headers: Optional[dict] = None) -> Tuple[int, dict]:
+    if not enabled():
+        raise BackendUnavailable("未配置 BACKEND_BASE_URL（主服务器地址）")
     url = base_url() + path
     body_text = json.dumps(body, ensure_ascii=False) if body is not None else None
     headers = {"Accept": "application/json"}
@@ -82,6 +80,12 @@ def _request(method: str, path: str, *, body: Optional[dict] = None,
         headers["Content-Type"] = "application/json; charset=utf-8"
     if token:
         headers["Authorization"] = "Bearer " + token
+    #调用方自定义头（如 X-Client-Ip）
+    if extra_headers:
+        for k, v in extra_headers.items():
+            if v:
+                headers[k] = v
+    #只有非 GET 且拿到签名密钥时才签名
     if sign_key and method.upper() != "GET":
         headers.update(_sign(method, path, body_text or "", sign_key))
 
@@ -107,12 +111,12 @@ def _request(method: str, path: str, *, body: Optional[dict] = None,
     try:
         payload = json.loads(raw) if raw else {}
     except Exception:
-        raise BackendError(f"主服务器返回非 JSON（HTTP {status}）") from None
+        raise BackendUnavailable(f"主服务器返回非 JSON（HTTP {status}）") from None
     return status, payload
 
 
+#从响应里取错误说明
 def _error_message(status: int, payload: dict) -> str:
-    #从响应里取错误说明
     msg = payload.get("message") or payload.get("error") or ""
     code = payload.get("code") or ""
     if msg:
@@ -120,85 +124,86 @@ def _error_message(status: int, payload: dict) -> str:
     return f"主服务器返回 HTTP {status}"
 
 
-_lock = threading.Lock()
-_tokens: Dict[str, Tuple[str, str, float]] = {}   #账号 -> 令牌 签名密钥 过期时间
+#按状态码与业务码分类抛出
+def _raise_for(status: int, payload: dict):
+    code = str(payload.get("code") or "")
+    message = _error_message(status, payload)
+    if status == 401:
+        raise BackendUnauthorized(message, status=status, code=code)
+    #来源 IP 被安全策略封禁属于基础设施故障 不是用户操作错误
+    if status == 403 and code == "IP_BANNED":
+        raise BackendUnavailable("主服务器安全策略拦截了本机来源地址：" + message,
+                                 status=status, code=code)
+    if 400 <= status < 500:
+        raise BackendRejected(message, status=status, code=code)
+    raise BackendUnavailable(message, status=status, code=code)
 
 
-def _cache_token(username: str, token: str, sign_key: str, ttl: int = 7200) -> None:
-    #缓存账号令牌
-    with _lock:
-        _tokens[username] = (token, sign_key, time.time() + max(60, ttl) - _TOKEN_MARGIN)
+#200 且 ok 才返回 data 其余一律抛
+def _unwrap(status: int, payload: dict) -> dict:
+    if status == 200 and payload.get("ok"):
+        return payload.get("data") or {}
+    _raise_for(status, payload)
+    return {}
 
 
-def _cached(username: str) -> Optional[Tuple[str, str]]:
-    #取未过期的缓存令牌
-    with _lock:
-        item = _tokens.get(username)
-    if not item:
-        return None
-    token, sign_key, exp = item
-    if time.time() >= exp:
-        with _lock:
-            _tokens.pop(username, None)
-        return None
-    return token, sign_key
+#解出 JWT 载荷 只用于取 sk 与 exp 不做验签
+def payload_of(token: str) -> dict:
+    parts = (token or "").split(".")
+    if len(parts) < 2:
+        return {}
+    body = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        return json.loads(base64.urlsafe_b64decode(body.encode()).decode("utf-8"))
+    except Exception:
+        return {}
 
 
-def login(username: str, password: str) -> dict:
-    #登录换令牌并缓存
-    status, payload = _request("POST", "/api/auth/login",
-                               body={"userName": username, "password": password})
-    if status != 200 or not payload.get("ok"):
-        message = _error_message(status, payload)
-        #4xx 是主服务器明确拒绝（口令错、账号停用、限流）：业务结论，调用方不许回落到本地表
-        if 400 <= status < 500:
-            raise BackendRejected(message)
-        raise BackendError(message)
-    data = payload.get("data") or {}
-    token = data.get("token") or ""
-    sign_key = data.get("signKey") or ""
-    if not token or not sign_key:
-        raise BackendError("主服务器登录响应缺少 token/signKey")
-    _cache_token(username, token, sign_key, int(data.get("expiresIn") or 7200))
-    return data.get("user") or {}
+#从令牌载荷取请求签名密钥
+def sign_key_of(token: str) -> str:
+    return str(payload_of(token).get("sk") or "")
 
 
-def ensure_login(username: str, password: str) -> Tuple[str, str]:
-    #取可用令牌 没有就重登
-    cached = _cached(username)
-    if cached:
-        return cached
-    login(username, password)
-    again = _cached(username)
-    if not again:
-        raise BackendError("主服务器登录后仍未取得令牌")
-    return again
+#令牌是否已在本地可判定为过期
+def token_expired(token: str, skew: int = 5) -> bool:
+    exp = payload_of(token).get("exp")
+    try:
+        return int(exp) <= int(time.time()) + skew
+    except (TypeError, ValueError):
+        return False
 
 
-def _authed_call(method: str, path: str, body: Optional[dict], username: str, password: str) -> dict:
-    #带令牌调用 过期重登一次
-    token, sign_key = ensure_login(username, password)
-
-    def once(tok: str, key: str) -> Tuple[int, dict]:
-        #发一次带签名的请求
-        return _request(method, path, body=body, token=tok, sign_key=key)
-
-    status, payload = once(token, sign_key)
-    if status == 401:                      #令牌过期 清缓存重登一次
-        with _lock:
-            _tokens.pop(username, None)
-        token, sign_key = ensure_login(username, password)
-        status, payload = once(token, sign_key)
-
-    if status != 200 or not payload.get("ok"):
-        if 400 <= status < 500:
-            raise BackendRejected(_error_message(status, payload))
-        raise BackendError(_error_message(status, payload))
-    return payload.get("data") or {}
+#登录换令牌 返回主服务器原始 data
+def login(username: str, password: str, client_ip: str = "") -> dict:
+    #带上真实客户端 IP 供主服务器按 (账号,IP) 做失败计数 避免被拿来锁别人账号
+    ip = _clean_ip(client_ip)
+    status, payload = _request(
+        "POST", "/api/auth/login",
+        body={"userName": username, "password": password},
+        extra_headers={"X-Client-Ip": ip} if ip else None,
+    )
+    return _unwrap(status, payload)
 
 
+#只放行单个合法 IP 版本 防止逗号串或超长内容被带出去
+def _clean_ip(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    try:
+        return str(ipaddress.ip_address(s))
+    except ValueError:
+        return ""
+
+
+#查当前令牌对应身份
+def me(token: str) -> dict:
+    status, payload = _request("GET", "/api/auth/me", token=token)
+    return _unwrap(status, payload)
+
+
+#日期归一成 YYYY-MM-DD
 def _normalize_date(value: str) -> str:
-    #日期归一成 YYYY-MM-DD
     s = (value or "").strip()
     if not s:
         return ""
@@ -215,24 +220,10 @@ def _normalize_date(value: str) -> str:
     return ""
 
 
-def submit_as(username: str, *, department: str, rtype: str, amount,
-              reason: str = "", has_invoice: str = "", city: str = "",
-              date_str: str = "", invoice_info: str = "") -> dict:
-    #用已登录会话提交
-    if not username:
-        raise BackendError("缺少登录用户名，无法向主服务器提交")
-    if not _cached(username):
-        raise BackendError("主服务器会话已过期，请重新登录后再提交")
-    return _submit_authed(username, department=department, rtype=rtype, amount=amount,
-                          reason=reason, has_invoice=has_invoice, city=city,
-                          date_str=date_str, invoice_info=invoice_info)
-
-
-def _submit_authed(username: str, *, department: str, rtype: str, amount,
-                   reason: str = "", has_invoice: str = "", city: str = "",
-                   date_str: str = "", invoice_info: str = "") -> dict:
-    #组装字段并提交报销单
-    token, sign_key = _cached(username) or ("", "")
+#提交报销单 身份由主服务器按令牌盖章
+def submit_with_token(token: str, sign_key: str, *, department: str, rtype: str, amount,
+                      reason: str = "", has_invoice: str = "", city: str = "",
+                      date_str: str = "", invoice_info: str = "") -> dict:
     body = {
         "department": department,
         "rtype": rtype,
@@ -243,17 +234,9 @@ def _submit_authed(username: str, *, department: str, rtype: str, amount,
         "invoiceDate": _normalize_date(date_str),
         "invoiceInfo": invoice_info or "",
     }
-    status, payload = _request("POST", "/api/invoice/submit", body=body, token=token, sign_key=sign_key)
-    if status == 401:
-        with _lock:
-            _tokens.pop(username, None)
-        raise BackendError("主服务器会话已过期，请重新登录后再提交")
-    if status != 200 or not payload.get("ok"):
-        if 400 <= status < 500:
-            #业务拒绝 不许绕过写入口
-            raise BackendRejected(_error_message(status, payload))
-        raise BackendError(_error_message(status, payload))
-    data = payload.get("data") or {}
+    status, payload = _request("POST", "/api/invoice/submit", body=body,
+                               token=token, sign_key=sign_key)
+    data = _unwrap(status, payload)
     return {
         "record_id": data.get("recordId") or "",
         "bill_no": data.get("billNo") or "",
@@ -261,35 +244,29 @@ def _submit_authed(username: str, *, department: str, rtype: str, amount,
     }
 
 
-def submit(username: str, password: str, *, department: str, rtype: str, amount,
-           reason: str = "", has_invoice: str = "", city: str = "",
-           date_str: str = "", invoice_info: str = "") -> dict:
-    #提交一张报销单
-    ensure_login(username, password)
-    return _submit_authed(username, department=department, rtype=rtype, amount=amount,
-                          reason=reason, has_invoice=has_invoice, city=city,
-                          date_str=date_str, invoice_info=invoice_info)
+#查报销单列表 范围由主服务器按令牌角色裁剪
+def list_invoices(token: str, sign_key: str = "", limit: int = 500) -> dict:
+    status, payload = _request("GET", f"/api/invoice/list?limit={int(limit)}",
+                               token=token, sign_key=sign_key)
+    return _unwrap(status, payload)
 
 
-def my_invoices(username: str, password: str, limit: int = 100) -> list:
-    #查我的报销单
-    data = _authed_call("GET", f"/api/invoice/list?limit={int(limit)}", None, username, password)
-    return data.get("rows") or []
+#审核报销单 仅财务及以上
+def review_with_token(token: str, sign_key: str, *, record_id: str, status_text: str,
+                      opinion: str) -> dict:
+    status, payload = _request("POST", "/api/invoice/review", body={
+        "recordId": record_id, "status": status_text, "opinion": opinion,
+    }, token=token, sign_key=sign_key)
+    return _unwrap(status, payload)
 
 
-def review(username: str, password: str, *, record_id: str, status: str, opinion: str) -> dict:
-    #审核报销单 仅财务或管理员
-    return _authed_call("POST", "/api/invoice/review", {
-        "recordId": record_id, "status": status, "opinion": opinion,
-    }, username, password)
+#取枚举字典与判定口径
+def meta_with_token(token: str) -> dict:
+    status, payload = _request("GET", "/api/invoice/meta", token=token)
+    return _unwrap(status, payload)
 
 
-def meta(username: str, password: str) -> dict:
-    #取枚举字典与规则
-    return _authed_call("GET", "/api/invoice/meta", None, username, password)
-
-
+#健康检查 无需登录
 def health() -> dict:
-    #主服务器健康检查 无需登录
-    _, payload = _request("GET", "/api/public/health")
-    return payload.get("data") or {}
+    status, payload = _request("GET", "/api/public/health")
+    return _unwrap(status, payload)

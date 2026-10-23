@@ -9,18 +9,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.feishu import (
     FeishuBitableClient,
     FeishuError,
-    build_reimbursement_record,
-    filter_by_schema,
-    public_view,
     REIMBURSEMENT_FIELDS,
-    _parse_date_to_ts,
     _build_multipart,
     DEPT_WHITELIST,
     CITY_WHITELIST,
     ALLOWED_INVOICE,
     COMPLIANCE_RESULTS,
     STATUS_VALUES,
-    validate_enum_fields,
 )
 from models.env import load_env
 
@@ -139,7 +134,7 @@ def test_create_records_returns_ids():
     #批量写记录返回 id 列表
     fake = FakeTransport()
     c = FeishuBitableClient("app_id", "app_secret", "app_token", transport=fake)
-    recs = [build_reimbursement_record(rtype="差旅费", amount=500)]
+    recs = [{"报销类型": "差旅费", "金额": 500}]
     ids = c.create_records("tblX", recs)
     assert ids == ["rec_1", "rec_2"], f"应返回 record_id 列表, got {ids}"
     assert fake.n_write_calls == 1
@@ -184,38 +179,10 @@ def test_error_code_raises_feishu_error():
     print("[PASS] test_error_code_raises_feishu_error")
 
 
-def test_public_view_shields_internal():
-    #对外视图屏蔽内部字段
-    rec = {"record_id": "rec_secret", "fields": {"单号": "BX1", "状态": "审批中", "未知字段": "x"}}
-    view = public_view(rec)
-    assert "record_id" not in view
-    assert "未知字段" not in view  #非业务字段也屏蔽
-    assert view["单号"] == "BX1" and view["状态"] == "审批中"
-    print("[PASS] test_public_view_shields_internal")
 
 
-def test_reimbursement_schema_complete():
-    #报销单字段拼装完整
-    rec = build_reimbursement_record(
-        rtype="差旅费", amount=800, applicant="张三", date_str="2026/9/10"
-    )
-    #只写业务字段 不含只读列
-    assert rec["报销类型"] == "差旅费" and rec["金额"] == 800
-    assert rec["申请人"] == "张三"
-    assert rec["状态"] == "待审核"
-    assert rec["票据状态"] == ""                 #未传默认空
-    assert isinstance(rec["发票日期"], int) and rec["发票日期"] > 0  #日期已转毫秒时间戳
-    assert "单号" not in rec and "工号" not in rec and "审核人" not in rec
-    print("[PASS] test_reimbursement_schema_complete")
 
 
-def test_parse_date_to_ts():
-    #日期转毫秒时间戳
-    ts = _parse_date_to_ts("2026/9/10")
-    assert isinstance(ts, int) and ts > 0
-    assert _parse_date_to_ts("") is None
-    assert _parse_date_to_ts("乱码") is None
-    print("[PASS] test_parse_date_to_ts")
 
 
 def test_load_env_explicit_path():
@@ -266,26 +233,8 @@ def test_field_names_caching():
     print("[PASS] test_field_names_caching")
 
 
-def test_filter_by_schema():
-    #按表结构过滤字段
-    rec = build_reimbursement_record(rtype="差旅费", amount=500, employee_id="E0001")
-    assert rec.get("工号") == "E0001", "传入 employee_id 应写入工号"
-    old_names = set(REIMBURSEMENT_FIELDS) - {"工号", "审批意见", "审批时间"}
-    rec_old = filter_by_schema(rec, old_names)
-    assert "工号" not in rec_old and "申请人" in rec_old, "旧表应剔除工号、保留其余字段"
-    rec_new = filter_by_schema(rec, REIMBURSEMENT_FIELDS)
-    assert rec_new.get("工号") == "E0001", "新表应保留工号"
-    assert filter_by_schema(rec, set()) == rec, "空集合（探测失败兜底）应原样返回"
-    print("[PASS] test_filter_by_schema")
 
 
-def test_build_record_employee_id_optional():
-    #工号可选不写键
-    rec = build_reimbursement_record(rtype="差旅费", amount=500)
-    assert "工号" not in rec
-    rec2 = build_reimbursement_record(rtype="差旅费", amount=500, employee_id="")
-    assert "工号" not in rec2
-    print("[PASS] test_build_record_employee_id_optional")
 
 
 def test_enum_constants_complete():
@@ -298,43 +247,13 @@ def test_enum_constants_complete():
     print("[PASS] test_enum_constants_complete")
 
 
-def test_validate_enum_fields_passes_valid():
-    #合规枚举值不报错
-    rec = build_reimbursement_record(
-        applicant="张三", department="研发部", rtype="差旅费", amount=800,
-        has_invoice="有票", city="上海", compliance="通过", status="待审核",
-    )
-    assert validate_enum_fields(rec) == [], "合规记录不应报错"
-    print("[PASS] test_validate_enum_fields_passes_valid")
 
 
-def test_validate_enum_fields_rejects_bogus():
-    #非法枚举值被捕获
-    rec = build_reimbursement_record(
-        applicant="张三", department="火星部", rtype="差旅费", amount=800,
-        has_invoice="有票", city="上海", compliance="通过", status="待审核",
-    )
-    errs = dict(validate_enum_fields(rec))
-    assert errs.get("部门") == "火星部", "应捕获非标准部门"
-    #再补一个脏城市复测
-    rec["城市"] = "火星城"
-    errs = dict(validate_enum_fields(rec))
-    assert errs.get("城市") == "火星城", "应捕获非标准城市"
-    #空值不参与校验
-    rec["部门"], rec["城市"] = "", ""
-    assert validate_enum_fields(rec) == []
-    print("[PASS] test_validate_enum_fields_rejects_bogus")
 
 
 def test_reimbursement_fields_include_invoice_columns():
-    #发票新列已登记
+    #发票新列已登记（字段适配改由主服务器负责，本层只保留字段清单）
     assert "发票信息" in REIMBURSEMENT_FIELDS and "发票附件" in REIMBURSEMENT_FIELDS
-    rec = build_reimbursement_record(rtype="差旅费", amount=500)
-    rec_new = filter_by_schema(rec, set(REIMBURSEMENT_FIELDS))
-    assert rec_new == rec, "新表 schema 下普通记录不受影响"
-    old_names = set(REIMBURSEMENT_FIELDS) - {"发票信息", "发票附件"}
-    rec_old = filter_by_schema(rec, old_names)
-    assert "发票信息" not in rec_old, "旧表应自动剔除 M9 新列"
     print("[PASS] test_reimbursement_fields_include_invoice_columns")
 
 
@@ -451,17 +370,10 @@ if __name__ == "__main__":
     test_list_records_returns_items()
     test_get_record_parses_nested_record()
     test_error_code_raises_feishu_error()
-    test_public_view_shields_internal()
-    test_reimbursement_schema_complete()
-    test_parse_date_to_ts()
     test_load_env_explicit_path()
     test_list_fields()
     test_field_names_caching()
-    test_filter_by_schema()
-    test_build_record_employee_id_optional()
     test_enum_constants_complete()
-    test_validate_enum_fields_passes_valid()
-    test_validate_enum_fields_rejects_bogus()
     test_reimbursement_fields_include_invoice_columns()
     test_build_multipart_format()
     test_upload_attachment_offline()

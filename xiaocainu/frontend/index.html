@@ -169,7 +169,7 @@
       <div class="logo">💰</div>
       <div class="title">
         <h1>小财奴</h1>
-        <p>企业财务报销助手 · 政策咨询 / 填单引导 / 合规预审 / 进度查询</p>
+        <p id="appSubtitle">企业财务报销助手 · 政策咨询 / 填单引导 / 合规预审 / 进度查询</p>
       </div>
       <div class="spacer"></div>
       <div class="user-badge" id="userBadge">
@@ -201,7 +201,7 @@
   <div class="login-mask" id="loginMask">
     <form class="login-card" id="loginForm">
       <h2>🔐 登录小财奴</h2>
-      <p class="sub">账号由管理员创建（角色：员工 / 财务 / 管理员）</p>
+      <p class="sub">账号由主服务器统一管理（超级管理员 / 管理员 / 财务部 / 员工）</p>
       <label for="loginUser">用户名</label>
       <input id="loginUser" autocomplete="username" placeholder="如 zhangsan" />
       <label for="loginPwd">密码</label>
@@ -230,7 +230,14 @@
   const whoAmI = document.getElementById("whoAmI");
   let authToken = sessionStorage.getItem("xc_token") || "";
   let currentUser = null;
+  // 权限键列表由主服务器下发（如 invoice.review / invoice.read.all）
+  let authPerms = [];
   try { currentUser = JSON.parse(sessionStorage.getItem("xc_user") || "null"); } catch (e) { currentUser = null; }
+  try { authPerms = JSON.parse(sessionStorage.getItem("xc_perms") || "[]"); } catch (e) { authPerms = []; }
+
+  function hasPerm(key) {
+    return Array.isArray(authPerms) && authPerms.indexOf(key) >= 0;
+  }
 
   function authHeaders() {
     return authToken ? { "Authorization": "Bearer " + authToken } : {};
@@ -246,10 +253,28 @@
       userBadge.style.display = "none";
       whoAmI.textContent = "";
     }
-    // 🛡️ 合规预审按钮仅财务/管理员可见（UX 层；真正的权限在服务端强制）
+    // 🛡️ 合规预审按钮按权限键显隐（UX 层；真正的权限由主服务器强制）
     const preChip = document.querySelector('[data-chip="pre"]');
-    const canPre = currentUser && (currentUser.角色 === "财务" || currentUser.角色 === "管理员");
-    if (preChip) preChip.style.display = canPre ? "" : "none";
+    if (preChip) preChip.style.display = hasPerm("invoice.review") ? "" : "none";
+    // 副标题同步：没有预审权限的账号不该看到「合规预审」这个词
+    const sub = document.getElementById("appSubtitle");
+    if (sub) {
+      sub.textContent = hasPerm("invoice.review")
+        ? "企业财务报销助手 · 政策咨询 / 填单引导 / 合规预审 / 进度查询"
+        : "企业财务报销助手 · 政策咨询 / 填单引导 / 进度查询";
+    }
+  }
+
+  // 登录失效统一处理：清本地登录态并弹出遮罩
+  function handle401(message) {
+    authToken = "";
+    currentUser = null;
+    authPerms = [];
+    sessionStorage.removeItem("xc_token");
+    sessionStorage.removeItem("xc_user");
+    sessionStorage.removeItem("xc_perms");
+    applyAuthUI();
+    showLogin(message || "登录已过期，请重新登录");
   }
 
   function showLogin(message) {
@@ -263,7 +288,7 @@
     sessionId = "web-" + Math.random().toString(36).slice(2, 12);
     pendingInvoice = null;  // M9：新对话丢弃暂存发票（内存即清，不残留）
     windowEl.innerHTML = "";
-    addMessage("bot", WELCOME_HTML);
+    addMessage("bot", welcomeHtml());
   }
 
   loginForm.addEventListener("submit", async (e) => {
@@ -283,8 +308,10 @@
       if (resp.ok) {
         authToken = data.token;
         currentUser = data.user || null;
+        authPerms = Array.isArray(data.perms) ? data.perms : [];
         sessionStorage.setItem("xc_token", authToken);
         sessionStorage.setItem("xc_user", JSON.stringify(currentUser));
+        sessionStorage.setItem("xc_perms", JSON.stringify(authPerms));
         if (data.session_id) sessionId = data.session_id;  // 切到服务端生成的新会话
         loginPwdEl.value = "";
         applyAuthUI();
@@ -302,25 +329,39 @@
   });
 
   document.getElementById("logoutBtn").addEventListener("click", async () => {
-    // 登出：通知服务端拉黑 token（尽力而为），本地立即失效
+    // 登出：通知服务端清缓存（主服务器不做令牌吊销），本地立即失效
     try { await fetch("/logout", { method: "POST", headers: authHeaders() }); } catch (e) {}
     authToken = "";
     currentUser = null;
+    authPerms = [];
     sessionStorage.removeItem("xc_token");
     sessionStorage.removeItem("xc_user");
+    sessionStorage.removeItem("xc_perms");
     applyAuthUI();
     resetChatToWelcome();
   });
 
   const INTENT_LABEL = { A: "政策咨询", B: "填单引导", C: "合规预审", D: "进度查询" };
 
-  // 欢迎语（初始渲染与「↺ 新对话」清空后共用同一份，改这里即可）
-  const WELCOME_HTML = "您好呀~ 我是小财奴 📒 可以帮您：<br>"
-    + "· 咨询报销制度（直接问我政策）<br>"
-    + "· 引导填写报销单（说「填单引导」看全参数说明）<br>"
-    + "· 提交前做合规预审（说「帮我预审 xxx」）<br>"
-    + "· 查询报销进度（说「查一下我的报销」）<br>"
-    + "点上方快捷按钮试试：咨询/预审会帮您把问题填进输入框（可改再发），填单/进度直接演示；再点同一个按钮会换下一个示例哦 👇";
+  // 没有预审权限的账号 即使问到相关话题也不显示「合规预审」标签
+  function intentLabel(intent) {
+    if (intent === "C" && !hasPerm("invoice.review")) return "政策咨询";
+    return INTENT_LABEL[intent] || intent;
+  }
+
+  // 欢迎语：按权限拼装（初始渲染与「↺ 新对话」清空后共用，改这里即可）
+  function welcomeHtml() {
+    const canPre = hasPerm("invoice.review");
+    let html = "您好呀~ 我是小财奴 📒 可以帮您：<br>"
+      + "· 咨询报销制度（直接问我政策）<br>"
+      + "· 引导填写报销单（说「填单引导」看全参数说明）<br>";
+    if (canPre) html += "· 提交前做合规预审（说「帮我预审 xxx」）<br>";
+    html += "· 查询报销进度（说「查一下我的报销」）<br>";
+    html += canPre
+      ? "点上方快捷按钮试试：咨询/预审会帮您把问题填进输入框（可改再发），填单/进度直接演示；再点同一个按钮会换下一个示例哦 👇"
+      : "点上方快捷按钮试试：咨询会帮您把问题填进输入框（可改再发），填单/进度直接演示；再点同一个按钮会换下一个示例哦 👇";
+    return html;
+  }
 
   function scrollBottom() { windowEl.scrollTop = windowEl.scrollHeight; }
 
@@ -348,7 +389,7 @@
 
   function renderBot(res) {
     const intent = res.intent || "";
-    const label = INTENT_LABEL[intent] || intent;
+    const label = intentLabel(intent);
     let html = "";
     if (intent) {
       html += `<span class="intent-badge i-${intent}">${label}</span><br>`;
@@ -397,6 +438,7 @@
     if (freshNextSend) { freshNextSend = false; newSession(); }  // 预填示例真正发出时才开新会话
     addMessage("user", escapeHtml(text).replace(/\n/g, "<br>"));
     inputEl.value = "";
+    resetInputHeight();  //清空后同步收回高度
     setBusy(true);
     const typing = addMessage("bot", '<span class="typing">小财奴正在思考…</span>');
 
@@ -423,12 +465,7 @@
         if (data.record_id) pendingInvoice = null;
       } else if (resp.status === 401) {
         // 登录过期/未登录：弹出登录遮罩（fail-closed，与网关认证墙对应）
-        authToken = "";
-        currentUser = null;
-        sessionStorage.removeItem("xc_token");
-        sessionStorage.removeItem("xc_user");
-        applyAuthUI();
-        showLogin("登录已过期，请重新登录");
+        handle401("登录已过期，请重新登录");
       } else if (resp.status === 429) {
         addMessage("bot", '<span class="err">⏳ 操作有点频繁啦，请稍后再试~</span>');
       } else if (resp.status === 422) {
@@ -455,6 +492,12 @@
     inputEl.style.height = "50px";
     inputEl.style.height = Math.min(inputEl.scrollHeight, 140) + "px";
   });
+
+  //发送后把输入框收回一行高度 否则多行内容撑开后一直留一片空白
+  function resetInputHeight() {
+    inputEl.style.height = "50px";
+    inputEl.scrollTop = 0;
+  }
 
   // ---------- M9 发票上传 OCR：📎 → /ocr 识别 → 结果卡片 → preview 预填草稿 ----------
   const clipBtn = document.getElementById("clipBtn");
@@ -518,9 +561,7 @@
         addMessage("bot", renderOcrCard(data));
         if (data.preview) await send(data.preview);  // 一句话预填 → B 分支自动合并追问
       } else if (resp.status === 401) {
-        authToken = ""; currentUser = null;
-        sessionStorage.removeItem("xc_token"); sessionStorage.removeItem("xc_user");
-        applyAuthUI(); showLogin("登录已过期，请重新登录");
+        handle401("登录已过期，请重新登录");
       } else if (resp.status === 429) {
         addMessage("bot", '<span class="err">⏳ 识别有点频繁啦，请稍后再试~</span>');
       } else if (resp.status === 413) {
@@ -616,12 +657,29 @@
     freshNextSend = false;
     sessionId = "web-" + Math.random().toString(36).slice(2, 12);
     windowEl.innerHTML = "";
-    addMessage("bot", WELCOME_HTML);
+    addMessage("bot", welcomeHtml());
   });
 
-  // 初始渲染欢迎语 + 应用登录态（有 token 直接进主界面，无 token 弹登录遮罩）
-  addMessage("bot", WELCOME_HTML);
+  // 初始渲染欢迎语 + 应用登录态（有 token 先向服务端验活，失效即弹遮罩）
+  addMessage("bot", welcomeHtml());
   applyAuthUI();
+
+  (async function validateSession() {
+    if (!authToken) return;
+    try {
+      const resp = await fetch("/me", { headers: authHeaders() });
+      if (resp.status === 401) { handle401("登录已过期，请重新登录"); return; }
+      if (!resp.ok) return;  // 服务端暂不可用时保留本地登录态，首次请求再判
+      const data = await resp.json().catch(() => ({}));
+      if (data && data.user) {
+        currentUser = data.user;
+        authPerms = Array.isArray(data.perms) ? data.perms : authPerms;
+        sessionStorage.setItem("xc_user", JSON.stringify(currentUser));
+        sessionStorage.setItem("xc_perms", JSON.stringify(authPerms));
+        applyAuthUI();
+      }
+    } catch (e) { /* 网络异常时不强制登出 */ }
+  })();
 
   inputEl.focus();
 </script>

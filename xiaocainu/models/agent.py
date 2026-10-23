@@ -1,6 +1,7 @@
 #编排路由层 检索加生成 分支路由
 from __future__ import annotations
 
+import json
 import os
 import random
 import re
@@ -13,16 +14,12 @@ from .llm import LLMAdapter
 from .feishu import (
     FeishuBitableClient,
     FeishuError,
-    build_reimbursement_record,
-    filter_by_schema,
-    public_view,
     ALLOWED_TYPES,
     DEPT_WHITELIST,
     CITY_WHITELIST,
     CITY_TIER,
-    validate_enum_fields,
 )
-from .users import ROLE_EMPLOYEE, ROLE_FINANCE, ROLE_ADMIN
+from .actor import Actor, PERM_INVOICE_READ_ALL, PERM_INVOICE_REVIEW
 
 SYSTEM_CONSULT = (
     "你是小财，一个企业财务报销助手。只能依据下方[资料]回答用户问题；"
@@ -95,6 +92,14 @@ _A_QUESTION_MARKERS = ("吗", "呢", "？", "?", "多少", "什么", "标准", "
 #填单引导口令 直接输出引导不走抽取
 FILL_GUIDE_TRIGGERS = {"填单引导", "填单指南"}
 
+#已提交后想补票或改单 对话里做不到 统一引导人工
+_AFTER_SUBMIT_KEYWORDS = ("补发票", "补传", "补个票", "补票", "改单", "修改报销单",
+                          "撤回", "作废", "提交后能改", "提交了还能改")
+_AFTER_SUBMIT_ANSWER = (
+    "🧾 已提交的报销单，对话里没法补传发票或修改。\n"
+    "请联系财务，或者重新上传材料齐全的报销单进飞书财务表。"
+)
+
 #引导开场收尾话术素材 随机切换
 _FILL_GUIDE_OPENERS = (
     "来啦来啦~ 填单引导这就安排上 (๑•̀ㅂ•́)و✧",
@@ -116,6 +121,7 @@ _SKIP_NAME = {"好的", "谢谢", "没有", "麻烦", "请问", "帮我", "这�
 #非人名字符 含则排除
 _NON_NAME_CHARS = set(
     "票费电发开报填审请查购采差出住餐吃车机油路话训推广活动团私司单金额类型部门"
+    "销交通补贴款宿"
     "理由事因为用于您我他她们这那没了的是不也都还再就才已有和与否如果比较标准规定"
     "介绍说明说么怎帮想要去回在哪能可该应或等及与"
 )
@@ -129,6 +135,37 @@ _CN_NUM = {
 #进度查询的伪姓名词
 _D_NAME_BLOCKLIST = {"进度", "报销", "记录", "单号", "状态", "结果", "详情", "信息"}
 _D_PRONOUN_CHARS = set("我你他她它谁咱")
+#泛指词 抽到这些等于没给筛选条件
+_D_GENERIC_KEYWORDS = {"所有人", "全部", "所有", "全员", "大家", "公司", "团队", "一下", "最近"}
+#进度查询单次最多展示条数 超出时按提交时间倒序取最近的
+_D_LIST_LIMIT = 50
+#事由遇到这些字段名就截断 避免把后面的参数一起吞进来
+_REASON_STOP = ("金额", "部门", "报销类型", "票据", "城市", "日期",
+                "发票号", "发票", "工号", "申请人", "备注")
+#追问事由时 这些短句不算回答
+_REASON_SMALL_TALK = {"好的", "好", "嗯", "可以", "行", "收到", "谢谢", "没有了", "无", "没了"}
+
+
+#判断一个词是否像真实姓名 用于申请人识别与代报拦截
+def _valid_person_name(name: str) -> bool:
+    name = (name or "").strip()
+    if not re.fullmatch(r"[一-龥]{2,4}", name):
+        return False
+    if name in _SKIP_NAME or name in _D_NAME_BLOCKLIST or name in _TYPE_WORDS:
+        return False
+    if any(ch in _NON_NAME_CHARS for ch in name):
+        return False
+    if any(ch in _D_PRONOUN_CHARS for ch in name):
+        return False
+    return True
+
+
+#毫秒时间戳转 int 用于按提交时间倒序 非法值当 0
+def _ms_key(v) -> int:
+    try:
+        return int(float(v or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _cn_num_token(tok: str):
@@ -278,46 +315,63 @@ class XiaoCaiAgent:
         #草稿是否仍在进行中
         if not isinstance(draft, dict):
             return False
+        #正在等事由 下一句仍算填单续答
+        if draft.get("await_reason"):
+            return True
         missing_core = not (draft.get("applicant") and draft.get("department")
                            and draft.get("category") and draft.get("amount"))
         blocked = draft.get("has_invoice") == "无票"
         return bool(missing_core or blocked)
 
     #统一入口 按意图分发
-    def route(self, question: str, history=None, base_draft=None, user: dict | None = None,
+    def route(self, question: str, history=None, base_draft=None, actor: Actor | None = None,
               image_b64: str = "", image_mime: str = "image/jpeg",
               invoice_fields: dict | None = None) -> dict:
-        #按意图路由到对应分支
+        #按意图路由到对应分支 未登录不放行任何业务分支
         if (question or "").strip() in FILL_GUIDE_TRIGGERS:
             return self._handle_fill_guide()
+        if actor is None:
+            return {
+                "intent": "A",
+                "answer": "🔐 请先登录后再使用报销助手（登录身份由主服务器校验）。",
+            }
+        #已提交后想补票/改单：对话里做不到，直接引导人工
+        if any(k in (question or "") for k in _AFTER_SUBMIT_KEYWORDS):
+            return {
+                "intent": "B",
+                "record_id": None,
+                "bill_no": "",
+                "answer": _AFTER_SUBMIT_ANSWER,
+                "draft": base_draft,
+            }
         intent = self.classify_intent(question)
         #填单中继续保持 B 分支
         _sticky = self._is_fill_in_progress(base_draft) or (isinstance(base_draft, dict) and base_draft.get("await_confirm"))
         if intent != "B" and base_draft and _sticky:
             if not self._has_strong_intent(question) and not self._is_explicit_question(question):
-                return self._handle_fill(question, base_draft=base_draft, user=user,
+                return self._handle_fill(question, base_draft=base_draft, actor=actor,
                                          image_b64=image_b64, image_mime=image_mime,
                                          invoice_fields=invoice_fields)
         #D 续答 继续走进度查询
         if intent == "A" and self._is_progress_name_followup(question, history):
-            return self._handle_progress(question, user=user)
+            return self._handle_progress(question, actor=actor)
         if intent == "A":
             return self._handle_consult(question, history=history)
         if intent == "B":
-            return self._handle_fill(question, base_draft=base_draft, user=user,
+            return self._handle_fill(question, base_draft=base_draft, actor=actor,
                                      image_b64=image_b64, image_mime=image_mime,
                                      invoice_fields=invoice_fields)
         if intent == "C":
-            #合规预审仅财务和管理员
-            if user and user.get("role") not in (ROLE_FINANCE, ROLE_ADMIN):
+            #合规预审仅对有审核权限的角色开放
+            if not actor.can(PERM_INVOICE_REVIEW):
                 return {
                     "intent": "C",
                     "answer": "🛡️ 合规预审仅对财务/管理员开放哦~ "
                               "您可以把单子提交上来等财务预审，有疑问也可以直接问我报销制度。",
                     "compliance": "", "risk_summary": "", "record_id": None,
                 }
-            return self._handle_compliance(question, base_draft=base_draft, user=user)
-        return self._handle_progress(question, user=user)
+            return self._handle_compliance(question, base_draft=base_draft, actor=actor)
+        return self._handle_progress(question, actor=actor)
 
     #A 咨询分支
     def _handle_consult(self, question: str, history=None) -> dict:
@@ -393,29 +447,30 @@ class XiaoCaiAgent:
         if m:
             result["department"] = normalize_department(m.group(1))
 
-        #申请人 我是或部门或查询等句式
+        #申请人 只认明确句式 不再从自由文本兜底猜名字
         m = re.search(r"我是\s*([一-龥]{2,4})", t)
         if not m:
             m = re.search(r"([一-龥]{2,4})\s*[,，]?\s*(?:研发部|市场部|传媒部门|电脑部门|部门)", t)
         if not m:
             m = re.search(r"查一下\s*([一-龥]{2,3})", t) or re.search(r"查\s*([一-龥]{2,3})的?报销", t)
-        if m:
-            result["applicant"] = m.group(1)
-        else:
-            #兜底姓名 只取 2 到 3 个净汉字
-            for tk in re.findall(r"[一-龥]{2,3}", t):
-                if tk in _SKIP_NAME:
-                    continue
-                if any(ch in _NON_NAME_CHARS for ch in tk):
-                    continue
-                result["applicant"] = tk
-                break
+        if not m:
+            #替帮代句式 用于识别并拦截代他人报账
+            m = re.search(r"(?:替|帮|代)\s*([一-龥]{2,3})\s*(?:报|报销|提交|填|交)", t)
+        if m and _valid_person_name(m.group(1)):
+            result["applicant"] = m.group(1).strip()
 
-        #事由 事由或用于或因为之后
-        m = re.search(r"(?:事由|用于|因为)[：: ]?([一-龥0-9，,。]{2,30})", t)
+        #事由 引导词之后取到标点为止 再按下一个字段名截断
+        m = re.search(r"(?:事由|用途|用于|因为|备注)\s*[：:是为]?\s*([^，,。；;！!\n]{2,60})", t)
         if m:
-            result["reason"] = m.group(1).strip(" ，,。")
-        else:
+            reason = m.group(1).strip(" 　，,。；;：:、")
+            for kw in _REASON_STOP:
+                i = reason.find(kw)
+                if i >= 2:
+                    reason = reason[:i]
+            reason = reason.strip(" 　，,。；;：:、")
+            if 2 <= len(reason) <= 200:
+                result["reason"] = reason
+        if not result["reason"]:
             #动作词后的描述须含两个实字
             m = re.search(r"(?:出差|请客|采购|打车)([一-龥0-9，,。 ]{2,20})", t)
             if m:
@@ -478,34 +533,6 @@ class XiaoCaiAgent:
             return ("通过", "无")
         return ("风险", "；".join(risks))
 
-    #取回可读单号
-    def _fit_schema(self, rec: dict) -> dict:
-        #按真实表字段过滤记录
-        fn = getattr(self.feishu, "field_names", None)
-        if fn is None:
-            return rec
-        try:
-            names = fn(self.table_id)
-        except FeishuError:
-            return rec
-        return filter_by_schema(rec, names)
-
-    def _fetch_bill_no(self, rid: str) -> str:
-        #取回飞书自动编号单号
-        if not (self.feishu and rid):
-            return ""
-        for attempt in range(2):
-            try:
-                rec = self.feishu.get_record(self.table_id, rid)
-                no = rec.get("fields", {}).get("单号", "")
-                if no:
-                    return no
-            except Exception:
-                pass
-            if attempt == 0:
-                time.sleep(0.4)  #首查为空则短延迟重试一次
-        return ""
-
     #识别确认提交意图
     @staticmethod
     def _is_confirm(text: str) -> bool:
@@ -517,24 +544,49 @@ class XiaoCaiAgent:
                                     "确认吧", "帮我提交", "没问题", "好的提交",
                                     "可以提交", "ok", "OK", "提交"))
 
-    #票据状态主要提醒
+    #票据状态提醒 按状态说用户要做的动作 不重复寒暄
     @staticmethod
     def _invoice_reminder(has_invoice: str) -> str:
-        #按票据状态给礼貌提醒
         if has_invoice == "有票":
-            return "🧾 您已带发票，这会加快审核进度，财务小伙伴能更快处理~"
+            return "🧾 已收到发票，审核会快一些~"
         if has_invoice == "无票":
-            return "🧾 暂未带发票，无发票需要更多核验时间，建议您尽快补开发票哦~"
-        #未提时引导补充票据状态
-        return "🧾 温馨提示：有发票会加快审核进度，无发票需要更多核验时间，建议补充一下票据状态~"
+            return ("🧾 这单还没有发票。可以上传发票，或上传详细的支付凭证"
+                    "（微信/支付宝「账单详情」页），\n"
+                    "我先帮您把金额、商户、时间填好；图片会保存到飞书财务表。")
+        return ("🧾 还没记票据状态：请上传发票或者上传详细的支付凭证"
+                "（微信/支付宝「账单详情」页）\n"
+                "先补信息。也可以直接回复「有发票」或「没发票」。")
+
+    #从一句补充里提事由：先剔除已被其它字段吃掉的词 避免整句塞进事由
+    @staticmethod
+    def _reason_from_answer(text: str, f: dict) -> str:
+        ans = (text or "").strip()
+        if not (2 <= len(ans) <= 200):
+            return ""
+        if XiaoCaiAgent._is_confirm(ans) or ans in _REASON_SMALL_TALK:
+            return ""
+        #整句就是别的字段 交给正常抽取 不当事由
+        if any(ans.startswith(k) for k in _REASON_STOP):
+            return ""
+        leftover = ans
+        #剔除本轮已识别的字段字面（只删第一次出现 避免误伤）
+        for key in ("department", "category", "city"):
+            v = str(f.get(key) or "").strip()
+            if len(v) >= 2:
+                leftover = leftover.replace(v, " ", 1)
+        #剔除金额与单位
+        leftover = re.sub(r"\d+(?:\.\d+)?\s*(?:元|块|钱|万)?", " ", leftover)
+        #剔除票据词
+        leftover = re.sub(r"有发票|没发票|无发票|有票|无票|未提", " ", leftover)
+        leftover = re.sub(r"\s+", " ", leftover).strip(" ，,。；;、")
+        #剩下的才可能是事由 太短说明整句都是别的字段 继续追问而不是硬塞
+        return leftover if 2 <= len(leftover) <= 200 else ""
 
     #非必填的软提示
     @staticmethod
     def _soft_hints(f: dict) -> list:
-        #返回可选的补充建议
+        #返回可选的补充建议（事由是必填项 不在这里提示）
         hints = []
-        if not f.get("reason"):
-            hints.append("💡 补充具体「事由」可以提高审核通过率哦~")
         #差旅费缺城市时提醒
         if f.get("category") == "差旅费" and not f.get("city"):
             hints.append("💡 补充消费「城市」可以加快审核速度~")
@@ -543,7 +595,7 @@ class XiaoCaiAgent:
     #填单追问与提交
     def _ask_missing(self, f: dict, missing: list) -> str:
         #列出已填与待补字段
-        lines = ["您好呀~ 我是小财奴，帮您梳理了一下报销信息 📝"]
+        lines = ["我帮您理了一下这单，还差几项就能提交~"]
         filled = []
         if f["applicant"]:
             filled.append(f"👤 申请人：{f['applicant']}")
@@ -553,8 +605,10 @@ class XiaoCaiAgent:
             filled.append(f"💼 报销类型：{f['category']}")
         if f["amount"]:
             filled.append(f"💰 金额：¥{f['amount']:.0f}")
-        if f["has_invoice"] and f["has_invoice"] != "未提":
+        if f["has_invoice"]:
             filled.append(f"🧾 票据：{f['has_invoice']}")
+        if f.get("reason"):
+            filled.append(f"📝 事由：{f['reason']}")
         if filled:
             lines.append("已记录：" + " · ".join(filled))
         need = []
@@ -563,27 +617,36 @@ class XiaoCaiAgent:
         if "部门" in missing:
             need.append("🏢 部门（您属于哪个部门呀？）")
         if "报销类型" in missing:
-            need.append("💼 报销类型（差旅/招待/办公用品/交通费？）")
+            need.append("💼 报销类型（差旅费 / 招待费 / 办公用品 / 交通费？）")
         if "金额" in missing:
             need.append("💰 金额（花了多少呀？）")
-        lines.append("✏️ 还需要补齐这几项哦：")
+        if "事由" in missing:
+            need.append("📝 事由（只说用途就行，例如「通勤」「客户招待餐费」）")
+        if "票据" in missing:
+            need.append(self._invoice_reminder(f["has_invoice"] or "未提"))
+        lines.append("还差：")
         lines.extend(need)
-        #票据状态提醒
-        lines.append("")
-        lines.append(self._invoice_reminder(f["has_invoice"] or "未提"))
+        #票据已并入「还差」清单时不再单独重复
+        inv = f["has_invoice"] or "未提"
+        if "票据" not in missing and inv in ("无票", "未提"):
+            lines.append("")
+            lines.append(self._invoice_reminder(inv))
         #顺带给出软提示
         hints = self._soft_hints(f)
         if hints:
             lines.append("")
-            lines.append("另外，补充以下信息能更快通过审核：")
             lines.extend(hints)
-        lines.append("补齐后我会请您核对信息，确认无误再上传飞书~")
+        lines.append("")
+        if f.get("await_reason") and "事由" in missing:
+            lines.append("事由单独补一句就行，已有的信息不用重复~")
+        else:
+            lines.append("直接一句话补充就行，补齐后我请您核对。")
         return "\n".join(lines)
 
     #确认前回显摘要
     def _ask_confirm(self, f: dict, has_invoice: str) -> str:
         #回显已填信息待用户确认
-        lines = ["✨ 信息已收集齐全，麻烦您核对一下~"]
+        lines = ["✨ 信息齐了，麻烦您核对一下~"]
         rows = [
             f"👤 申请人：{f['applicant']}",
             f"🏢 部门：{f['department']}",
@@ -597,34 +660,35 @@ class XiaoCaiAgent:
         rows.append(f"🧾 票据：{has_invoice}")
         lines.append("📋 当前已填信息：")
         lines.extend(rows)
-        #事由备注提示
-        lines.append("📝 备注：报销的主要事情或用途，请通过「事由」补充告诉我，方便财务审核归类~")
-        #票据状态提醒
-        lines.append(self._invoice_reminder(has_invoice))
-        #城市日期等软提醒
-        soft = [h for h in self._soft_hints(f) if "事由" not in h]
+
+        #提交前先算一次合规 有问题提前告知 别等提交后被打回
+        compliance, risk_summary = self._compliance_check({**f, "has_invoice": has_invoice})
+        blocked = compliance == "阻断"
+        if blocked:
+            lines.append("")
+            lines.append(f"🚫 {risk_summary}")
+        elif compliance != "通过":
+            lines.append("")
+            lines.append(f"⚠️ 风险提示：{risk_summary}")
+
+        #事由缺失时提示补充（正常流程不可达 留作兜底）
+        if not str(f.get("reason") or "").strip():
+            lines.append("📝 备注：报销的主要事情或用途，请补充「事由」后我再帮您提交~")
+        #票据引导：风险摘要已点明状态时只补动作 不重复说一遍
+        if not blocked and has_invoice in ("无票", "未提"):
+            if "票据状态" in risk_summary:
+                lines.append("🧾 可直接上传发票或支付凭证补上（微信/支付宝「账单详情」页）。")
+            else:
+                lines.append(self._invoice_reminder(has_invoice))
+        #城市等软提醒
+        soft = self._soft_hints(f)
         if soft:
             lines.append("")
             lines.append("💡 还有这些可补充（非必填，补了更快通过）：")
             lines.extend(soft)
         lines.append("")
-        lines.append("✅ 请确认信息，回复「确认提交」即可开始上传飞书~")
-        return "\n".join(lines)
-
-    #无票软确认 给二选一
-    def _ask_no_invoice_confirm(self, f: dict) -> str:
-        #无票坚持提交时软确认不硬拦
-        lines = [
-            "🧾 温馨提示：这一单您说的是「无票」哦~",
-            "按《报销制度》，没有合规发票的报销，财务是无法正常审核通过的。",
-            "",
-            "您可以选择：",
-            "🧾 回复「有发票了」—— 补上票据状态，我帮您正常提交；",
-            "🚀 回复「仍要提交」—— 我按您的决定提交给财务，"
-            "并标注「无票提交，财务将驳回」。",
-            "",
-            "（也可以继续补充或修改其他报销信息~）",
-        ]
+        lines.append("✅ 补齐发票后回复我，我马上帮您提交~" if blocked
+                     else "✅ 确认无误请回复「确认提交」；有误请直接说要改哪一项，我帮您改~")
         return "\n".join(lines)
 
     #跨轮草稿合并
@@ -658,10 +722,11 @@ class XiaoCaiAgent:
             "🏢 部门 —— 您在哪个部门高就呀？",
             "💼 报销类型 —— 差旅费 / 招待费 / 办公用品 / 交通费，四选一",
             "💰 金额 —— 这次一共花了多少呀？",
+            "📝 事由 —— 报销的主要事情或用途写在这里，财务小伙伴全靠它归类~",
             "",
             "【重点提醒 · 直接影响审核速度】",
-            "🧾 票据状态 —— 有发票会加快审核进度；无发票需要更多核验时间哦",
-            "📝 事由 —— 报销的主要事情或用途写在这里，财务小伙伴全靠它归类~",
+            "🧾 票据状态 —— 有发票会加快审核进度；暂时没有发票，可以上传微信/支付宝"
+            "的详细支付记录（「账单详情」页）先补信息",
             "",
             "【选填 · 补了更好】",
             "📍 城市 —— 出差住宿的话说一声城市，可以加快审核",
@@ -679,7 +744,7 @@ class XiaoCaiAgent:
         }
 
     #填单主干 合并草稿后追问或提交
-    def _handle_fill(self, question: str, base_draft=None, user: dict | None = None,
+    def _handle_fill(self, question: str, base_draft=None, actor: Actor | None = None,
                      image_b64: str = "", image_mime: str = "image/jpeg",
                      invoice_fields: dict | None = None) -> dict:
         #抽取本轮字段并合并历史草稿
@@ -689,21 +754,30 @@ class XiaoCaiAgent:
             #保留待确认标记
             if base_draft.get("await_confirm"):
                 f["await_confirm"] = True
-        #姓名以账号为准 部门以口述为准
-        if user:
-            if user.get("name"):
-                f["applicant"] = user["name"]
-            if not f.get("department") and user.get("department"):
-                f["department"] = user["department"]
+        #申请人恒等于登录身份；只有抽到像真名且不是本人时才拦截
+        if actor is not None:
+            spoken = str(f.get("applicant") or "").strip()
+            if (spoken and spoken not in (actor.display_name, actor.username)
+                    and _valid_person_name(spoken)):
+                return {
+                    "intent": "B",
+                    "record_id": None,
+                    "bill_no": "",
+                    "answer": (f"🚫 报销单只能由本人提交：当前登录身份是 {actor.display_name}"
+                               f"（{actor.employee_id or '无工号'}），不能替「{spoken}」报账。"
+                               "请让本人登录后自己提交~"),
+                    "draft": None,
+                }
+            f["applicant"] = actor.display_name
         #并入 OCR 发票号与销售方
         if invoice_fields:
             for _k in ("invoice_no", "invoice_seller"):
                 _v = str(invoice_fields.get(_k) or "").strip()
                 if _v:
                     f[_k] = _v[:64]
-        #有票时清除无票确认标记
-        if f.get("has_invoice") == "有票":
-            f.pop("no_invoice_warned", None)
+        #只要识别出发票号就判为有票：图片证据优先于口述（含"没发票"也要纠正）
+        if str(f.get("invoice_no") or "").strip():
+            f["has_invoice"] = "有票"
         result = {"intent": "B", "record_id": None, "bill_no": "", "answer": "", "draft": f}
 
         #专项流程不直交 引导走专项
@@ -715,7 +789,12 @@ class XiaoCaiAgent:
             )
             return result
 
-        #必填项 申请人部门类型金额
+        #上一轮刚追问过事由 这一句里剔除已知字段后剩下的才当事由
+        if (isinstance(base_draft, dict) and base_draft.get("await_reason")
+                and not f.get("reason")):
+            f["reason"] = self._reason_from_answer(question, f)
+
+        #必填项 申请人部门类型金额事由
         missing = []
         if not f.get("applicant"):
             missing.append("申请人")
@@ -725,39 +804,27 @@ class XiaoCaiAgent:
             missing.append("报销类型")
         if not f.get("amount") or f["amount"] <= 0:
             missing.append("金额")
+        if len(str(f.get("reason") or "").strip()) < 2:
+            missing.append("事由")
+        #只有「有票」才算票据齐了 无票/未提都要先把票补上
+        if f.get("has_invoice") not in ("有票",):
+            missing.append("票据")
 
         if missing:
             result["answer"] = self._ask_missing(f, missing)
+            #记下是否在等事由 供下一句直接承接
+            result["draft"]["await_reason"] = "事由" in missing
             return result
+        result["draft"]["await_reason"] = False
 
         #票据状态归一 未提不阻断
         has_invoice = f["has_invoice"] if f["has_invoice"] in ("有票", "无票") else "未提"
 
         #必填齐全 进入确认态 不直接写表
         if f.get("await_confirm") and self._is_confirm(question):
-            #无票先软确认一次 用户坚持则放行
-            compliance, risk_summary = self._compliance_check({**f, "has_invoice": has_invoice})
-            if compliance == "阻断" and has_invoice == "无票":
-                if not f.get("no_invoice_warned"):
-                    #首次坚持 软确认不写表
-                    result["draft"]["await_confirm"] = True
-                    result["draft"]["no_invoice_warned"] = True
-                    result["answer"] = self._ask_no_invoice_confirm(f)
-                    return result
-                #再次坚持 放行写表并标驳回
-                answer, rid, bill_no = self._do_submit(
-                    f, has_invoice,
-                    compliance="驳回",
-                    risk_summary="无票提交（用户确认坚持），财务将驳回",
-                    employee_id=(user or {}).get("employee_id", ""),
-                    image_b64=image_b64, image_mime=image_mime,
-                    username=(user or {}).get("username", ""),
-                )
-            else:
-                answer, rid, bill_no = self._do_submit(
-                    f, has_invoice, employee_id=(user or {}).get("employee_id", ""),
-                    image_b64=image_b64, image_mime=image_mime,
-                    username=(user or {}).get("username", ""))
+            answer, rid, bill_no = self._do_submit(
+                f, has_invoice, actor=actor,
+                image_b64=image_b64, image_mime=image_mime)
             result["answer"] = answer
             result["record_id"] = rid
             result["bill_no"] = bill_no
@@ -772,24 +839,21 @@ class XiaoCaiAgent:
         return result
 
     #主服务器唯一写入口
-    @staticmethod
-    def _submit_via_backend(f: dict, has_invoice: str, invoice_info_only: bool = False,
-                            username: str = ""):
-        #提交给主服务器 未启用返回 None
-        try:
-            from api import backend_client  #延迟导入 未启用则无开销
-        except Exception:
-            return None
-        if not backend_client.enabled():
-            return None
+    def _submit_via_backend(self, f: dict, has_invoice: str, actor: Actor | None = None,
+                            image_b64: str = "", image_mime: str = "image/jpeg"):
+        #提交给主服务器 失败一律不写飞书
+        from api import backend_client
+
+        if actor is None:
+            return ("🔐 登录状态已失效，请重新登录后再提交。", None, "")
 
         invoice_info = "；".join(
             x for x in (str(f.get("invoice_no") or "").strip(),
                         str(f.get("invoice_seller") or "").strip()) if x
         )
         try:
-            data = backend_client.submit_as(
-                username or f.get("username", ""),
+            data = backend_client.submit_with_token(
+                actor.token, actor.sign_key,
                 department=f.get("department", ""),
                 rtype=f.get("category", ""),
                 amount=f.get("amount", 0),
@@ -799,20 +863,23 @@ class XiaoCaiAgent:
                 date_str=f.get("date", ""),
                 invoice_info=invoice_info,
             )
+        except backend_client.BackendUnauthorized:
+            return ("🔐 登录状态已失效，请重新登录后再提交。", None, "")
         except backend_client.BackendRejected as e:
-            #业务规则拒绝 绝不回落直连飞书
+            #业务规则拒绝 绝不绕过写入口
             return (f"⚠️ 这张单没有提交成功：{e}", None, "")
         except backend_client.BackendError as e:
-            if backend_client.mode() == "required":
-                return (f"😥 主服务器暂时不可用，单据没有提交（{e}）。请稍后重试或联系管理员。", None, "")
-            #仅基础设施故障才回落直连飞书
-            print(f"[backend] 提交未走主服务器，回落直连飞书：{e}")
-            return None
+            return (f"😥 主服务器暂时不可用，单据没有提交（{e}）。请稍后重试或联系管理员。", None, "")
 
         rid = data.get("record_id") or ""
         bill_no = data.get("bill_no") or ""
         if not rid:
             return (f"😥 主服务器没有返回单据编号（{data.get('message', '')}），请稍后在进度查询里确认。", None, "")
+
+        #单据已落库 再把发票图片写进附件列 失败不阻断主流程
+        attach_note = ""
+        if image_b64:
+            attach_note = self._attach_invoice(rid, image_b64, image_mime)
 
         parts = [f"👤 {f.get('applicant', '')}"]
         if f.get("department"):
@@ -836,100 +903,27 @@ class XiaoCaiAgent:
         if hints:
             answer_lines.append("")
             answer_lines.extend(hints)
+        if attach_note:
+            answer_lines.append(attach_note)
         answer_lines.append("财务小伙伴会尽快审核，结果出来会有通知~")
         return ("\n".join(answer_lines), rid, bill_no)
 
     #确认后真正写表
     def _do_submit(self, f: dict, has_invoice: str,
                    compliance: str | None = None, risk_summary: str | None = None,
-                   employee_id: str = "", image_b64: str = "", image_mime: str = "image/jpeg",
-                   username: str = ""):
-        #预审加写库并回显结果
+                   actor: Actor | None = None,
+                   image_b64: str = "", image_mime: str = "image/jpeg"):
+        #预审不通过不提交 通过则走主服务器唯一写入口
         if compliance is None:
             compliance, risk_summary = self._compliance_check({**f, "has_invoice": has_invoice})
         if compliance == "阻断":
             return (f"🧾 {risk_summary}，补齐合规发票后我马上帮您提交~", None, "")
-
-        #先走主服务器写入口
-        backend_result = self._submit_via_backend(f, has_invoice, invoice_info_only=False,
-                                                  username=username)
-        if backend_result is not None:
-            return backend_result
-
-        rec = build_reimbursement_record(
-            applicant=f["applicant"], department=f["department"], rtype=f["category"],
-            amount=f["amount"], reason=f.get("reason", ""), has_invoice=has_invoice,
-            city=f.get("city", ""), date_str=f.get("date", ""), compliance=compliance, risk_summary=risk_summary,
-            status="待审核", employee_id=employee_id,
-        )
-        #有发票信息才写该列
-        invoice_info = "；".join(
-            x for x in (str(f.get("invoice_no") or "").strip(),
-                        str(f.get("invoice_seller") or "").strip()) if x
-        )
-        if invoice_info:
-            rec["发票信息"] = invoice_info
-        rec = self._fit_schema(rec)  #旧表无该列时剔除
-        #写前枚举校验 非法值拒写
-        enum_errors = validate_enum_fields(rec)
-        if enum_errors:
-            bad = "；".join(f"{fld}={val!r}" for fld, val in enum_errors)
-            return (f"⚠️ 以下字段值不在企业标准枚举内，已拒绝写入以保护数据：{bad}。"
-                    f"请按规范填写后重试~", None, "")
-        if self.feishu and self.table_id:
-            try:
-                ids = self.feishu.create_records(self.table_id, [rec])
-                rid = ids[0] if ids else None
-                bill_no = self._fetch_bill_no(rid) if rid else ""
-                #上传发票附件 失败不阻断
-                attach_note = ""
-                if image_b64 and rid:
-                    attach_note = self._attach_invoice(rid, image_b64, image_mime)
-                #取不到单号时诚实兜底
-                if bill_no:
-                    bill_line = f"📋 单号：{bill_no}"
-                else:
-                    bill_line = "📋 单号：已成功提交，稍后可在「进度查询」中输入姓名查看"
-                #回显已提交参数
-                parts = [f"👤 {f['applicant']}"]
-                if f.get("department"):
-                    parts.append(f"🏢 {f['department']}")
-                if f.get("category"):
-                    parts.append(f"💼 {f['category']}")
-                parts.append(f"💰 ¥{f['amount']:.0f}")
-                if f.get("city"):
-                    parts.append(f"📍 {f['city']}")
-                if f.get("reason"):
-                    parts.append(f"📝 {f['reason']}")
-                answer_lines = [
-                    "✅ 报销单已成功提交到飞书表格啦！",
-                    "",
-                    bill_line,
-                    " · ".join(parts),
-                    "📊 当前状态：待审核",
-                ]
-                if compliance != "通过":
-                    answer_lines.append(f"📌 合规结果：{compliance} / {risk_summary}")
-                if attach_note:
-                    answer_lines.append(attach_note)
-                #提交后仍给软提示
-                hints = self._soft_hints(f)
-                if hints:
-                    answer_lines.append("")
-                    answer_lines.extend(hints)
-                answer_lines.append(
-                    "财务小伙伴会尽快审核，结果出来会有通知~ 您也可以随时问我"
-                    "「我的报销进度怎么样了」来查看状态哦 💡"
-                )
-                return ("\n".join(answer_lines), rid, bill_no)
-            except FeishuError as e:
-                return (f"😥 抱歉，提交没能成功（{e}），需要我帮您重新提交吗？", None, "")
-        return (
-            f"📋 填单引导：信息齐全（申请人 {f['applicant']}，{f['department']}，"
-            f"{f['category']} ¥{f['amount']:.0f}），飞书未接入，未实际写入。",
-            None,
-            "",
-        )
+        #网关侧硬性要求：只有「有票」才允许提交（无票/未提一律拦住）
+        if has_invoice != "有票":
+            return ("🧾 请先补上发票，或上传微信/支付宝「账单详情」页的支付记录，"
+                    "我才能帮您提交~", None, "")
+        return self._submit_via_backend(f, has_invoice, actor=actor,
+                                        image_b64=image_b64, image_mime=image_mime)
 
     #发票附件存档
     _MIME_EXT = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
@@ -958,8 +952,8 @@ class XiaoCaiAgent:
         except Exception as e:  #附件异常不影响主流程
             return f"📎 发票图片存档未成功（{e}）；单据本身已提交成功，可稍后补传"
 
-    #合规预审并回写
-    def _handle_compliance(self, question: str, base_draft=None, user: dict | None = None) -> dict:
+    #合规预审 只给结论不建单
+    def _handle_compliance(self, question: str, base_draft=None, actor: Actor | None = None) -> dict:
         #抽取并合并草稿后预审
         f = self._extract_fields(question)
         if base_draft:
@@ -980,45 +974,15 @@ class XiaoCaiAgent:
             result["answer"] = f"🧾 {risk_summary}，补齐合规发票后我再帮您预审~"
             return result
 
-        #信息齐全才回写 否则仅给建议
-        ready = bool(f["applicant"] and f["category"] and f["amount"] > 0 and f["has_invoice"] == "有票")
-        backend_done = False
-        if ready:
-            #先走主服务器写入口
-            via = self._submit_via_backend(f, f["has_invoice"],
-                                           username=(user or {}).get("username", ""))
-            if via is not None:
-                backend_answer, backend_rid, _ = via
-                result["record_id"] = backend_rid
-                if backend_answer:
-                    result["answer"] = backend_answer
-                backend_done = True
-
-        if ready and not backend_done and self.feishu and self.table_id:
-            try:
-                rec = build_reimbursement_record(
-                    applicant=f["applicant"], department=f["department"], rtype=f["category"],
-                    amount=f["amount"], reason=f["reason"], has_invoice=f["has_invoice"],
-                    city=f["city"], date_str=f["date"], compliance=compliance, risk_summary=risk_summary,
-                    status="待审核",
-                )
-                rec = self._fit_schema(rec)  #旧表无该列时剔除
-                #写前枚举校验 非法值拒写
-                enum_errors = validate_enum_fields(rec)
-                if enum_errors:
-                    bad = "；".join(f"{fld}={val!r}" for fld, val in enum_errors)
-                    result["answer"] = f"⚠️ 预审通过，但字段值不在企业标准枚举内，已拒绝回写飞书：{bad}。"
-                    return result
-                ids = self.feishu.create_records(self.table_id, [rec])
-                result["record_id"] = ids[0] if ids else None
-            except FeishuError as e:
-                result["answer"] = f"⚠️ 预审完成（{compliance}），但飞书回写失败：{e}。"
-
-        if not result["answer"]:
-            if compliance == "通过":
-                result["answer"] = "✅ 合规预审：通过，无风险点。"
-            else:
-                result["answer"] = f"✅ 合规预审：存在风险。风险点：{risk_summary}"
+        if compliance == "通过":
+            head = "✅ 合规预审：通过，无风险点。"
+        else:
+            head = f"✅ 合规预审：存在风险。风险点：{risk_summary}"
+        #预审不建单 建单只能由申请人本人走填单分支
+        result["answer"] = (
+            head + "\n\n💡 本预审只给结论、不创建单据；"
+            "正式提交请由申请人本人到「填单」里确认提交。"
+        )
         return result
 
     #进度查询 按申请人或单号
@@ -1066,24 +1030,60 @@ class XiaoCaiAgent:
         return am.group(1) if am else ""
 
     @staticmethod
-    def _record_hit(keyword: str, fields: dict, question: str) -> bool:
-        #判断记录是否命中查询词
+    def _record_hit(keyword: str, row: dict, question: str) -> bool:
+        #只比对单号与申请人 不做任意字段匹配
         if not keyword:
             return False
-        no = str(fields.get("单号", "") or "").strip()
+        no = str(row.get("单号") or "").strip()
         if no:
             k = keyword.upper().replace("-", "")
             n = no.upper().replace("-", "")
             if k in n or n in k:
                 return True
-        applicant = str(fields.get("申请人", "") or "").strip()
-        if applicant and (keyword in applicant or applicant in keyword):
-            return True
-        for v in fields.values():
-            s = str(v).strip()
-            if len(s) >= 2 and not s.isdigit() and s in question:
-                return True
-        return False
+        applicant = str(row.get("申请人") or "").strip()
+        return bool(applicant) and (keyword in applicant or applicant in keyword)
+
+    #把主服务器返回的行转成中文键视图 前端按中文键渲染
+    @staticmethod
+    def _csharp_row_view(row: dict) -> dict:
+        row = row or {}
+        attach = ""
+        raw = row.get("raw")
+        blob = raw.get("发票附件") if isinstance(raw, dict) else None
+        if isinstance(blob, str) and blob.strip():
+            try:
+                parsed = json.loads(blob)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                attach = "、".join(
+                    str(i.get("name") or "附件") if isinstance(i, dict) else str(i)
+                    for i in parsed if i
+                )
+            else:
+                attach = blob.strip()
+        return {
+            "单号": row.get("billNo") or "",
+            "申请人": row.get("applicant") or "",
+            "工号": row.get("employeeId") or "",
+            "部门": row.get("department") or "",
+            "报销类型": row.get("rtype") or "",
+            "金额": row.get("amount"),
+            "事由": row.get("reason") or "",
+            "票据状态": row.get("hasInvoice") or "",
+            "城市": row.get("city") or "",
+            "发票日期": row.get("invoiceDate") or "",
+            "记录提交时间": row.get("submittedAt") or "",
+            "合规结果": row.get("compliance") or "",
+            "风险摘要": row.get("riskSummary") or "",
+            "状态": row.get("status") or "",
+            "审核人": row.get("reviewer") or "",
+            "审批意见": row.get("reviewOpinion") or "",
+            "审批时间": row.get("reviewedAt") or "",
+            "发票信息": row.get("invoiceInfo") or "",
+            "发票附件": attach,
+            "record_id": row.get("recordId") or "",
+        }
 
     #展示格式化
     @staticmethod
@@ -1102,71 +1102,57 @@ class XiaoCaiAgent:
         except (OverflowError, OSError, ValueError):
             return str(v)
 
-    @staticmethod
-    def _fmt_attach(v) -> str:
-        #附件列转为附件名
-        if isinstance(v, list) and v:
-            names = []
-            for it in v:
-                if isinstance(it, dict):
-                    names.append(str(it.get("name") or "附件"))
-                else:
-                    names.append(str(it))
-            return "、".join(n for n in names if n)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-        return ""
-
-    def _handle_progress(self, question: str, user: dict | None = None) -> dict:
-        #查飞书并汇总进度
-        keyword = self._d_extract_keyword(question)
-        hit_question = question
-        #员工只能查自己 防越权查询
-        if user and user.get("role") == ROLE_EMPLOYEE:
-            keyword = user.get("name") or user.get("username") or keyword
-            hit_question = keyword
+    def _handle_progress(self, question: str, actor: Actor | None = None) -> dict:
+        #查询范围由主服务器按令牌角色裁剪 这里只做关键词过滤与展示
         result = {"intent": "D", "records": [], "answer": ""}
+        if actor is None:
+            result["answer"] = "🔐 请先登录后再查询报销进度。"
+            return result
 
-        if not keyword:
+        keyword = self._d_extract_keyword(question)
+        #泛指的“所有人/全部”之类不算筛选条件
+        if keyword in _D_GENERIC_KEYWORDS:
+            keyword = ""
+        #没有查看全部权限的角色 只查本人
+        if not actor.can(PERM_INVOICE_READ_ALL):
+            looks_like_bill = bool(re.match(r"^BX-?\d", keyword or "", re.I))
+            if not looks_like_bill:
+                keyword = actor.display_name or actor.username
+
+        if not keyword and not actor.can(PERM_INVOICE_READ_ALL):
             result["answer"] = "⏳ 请提供姓名或报销单号（如 BX000013），我帮您查进度~"
             return result
 
-        if self.feishu and self.table_id:
-            try:
-                recs = self.feishu.list_records(self.table_id, page_size=50)
-                matched = [
-                    public_view(r) for r in recs
-                    if self._record_hit(keyword, r.get("fields", {}), hit_question)
-                ]
-                result["records"] = matched
-                if matched:
-                    lines = ["好的，帮您查到啦~"]
-                    for i, m in enumerate(matched, 1):
-                        st = str(m.get("状态") or "").strip()
-                        emoji = {"已通过": "✅", "待审核": "⏳", "审核中": "🔍", "已驳回": "❌"}.get(st, "📊")
-                        amount = m.get("金额")
-                        amount_s = f"¥{amount}" if amount not in (None, "") else "无"
-                        #全字段展示 空值显示无
-                        lines += [
-                            f"{i}. 📋 单号 {m.get('单号') or '无'}",
-                            f"   👤 申请人：{m.get('申请人') or '无'} · 部门：{m.get('部门') or '无'} · 工号：{m.get('工号') or '无'}",
-                            f"   💼 报销类型：{m.get('报销类型') or '无'} · 金额：{amount_s}",
-                            f"   📝 事由：{m.get('事由') or '无'}",
-                            f"   🏙️ 城市：{m.get('城市') or '无'} · 发票日期：{self._fmt_ts(m.get('发票日期')) or '无'}",
-                            f"   🕐 提交时间：{self._fmt_ts(m.get('记录提交时间')) or '无'}",
-                            f"   🧾 票据状态：{m.get('票据状态') or '无'} · 发票信息：{m.get('发票信息') or '无'} · 发票附件：{self._fmt_attach(m.get('发票附件')) or '无'}",
-                            f"   📊 状态：{emoji} {st or '无'}",
-                            f"   📌 合规结果：{m.get('合规结果') or '无'} · 风险摘要：{m.get('风险摘要') or '无'}",
-                            f"   👮‍♂️ 审核人：{m.get('审核人') or '无'} · 审批意见：{m.get('审批意见') or '无'} · 审批时间：{self._fmt_ts(m.get('审批时间')) or '无'}",
-                        ]
-                    lines.append("💡 有驳回单建议联系审核人，待审核请耐心等待审批~")
-                    result["answer"] = "\n".join(lines)
-                else:
-                    result["answer"] = "⏳ 没有找到相关的报销记录呢~ 请确认姓名或单号是否正确？"
-            except FeishuError as e:
-                result["answer"] = f"⏳ 飞书查询失败（{e}），建议稍后重试或联系财务同学~"
-        else:
-            result["answer"] = "⏳ 进度查询需要接入飞书（M3），当前未接入。"
+        from api import backend_client
+        try:
+            data = backend_client.list_invoices(actor.token, actor.sign_key, limit=500)
+        except backend_client.BackendUnauthorized:
+            result["answer"] = "🔐 登录状态已失效，请重新登录后再查询。"
+            return result
+        except backend_client.BackendError as e:
+            result["answer"] = f"⏳ 报销单查询失败（{e}），建议稍后重试或联系财务同学~"
+            return result
+
+        rows = [self._csharp_row_view(r) for r in (data.get("rows") or [])]
+        hits = [r for r in rows if not keyword or self._record_hit(keyword, r, question)]
+        #按提交时间倒序 最新的排最前 再截断
+        hits.sort(key=lambda r: _ms_key(r.get("记录提交时间")), reverse=True)
+        total = len(hits)
+        matched = hits[:_D_LIST_LIMIT]
+        result["records"] = matched
+        if not matched:
+            result["answer"] = "⏳ 没有找到相关的报销记录呢~ 请确认姓名或单号是否正确？"
+            return result
+
+        #明细交给前端卡片渲染 这里只给一句摘要 避免同一批单据重复展示两遍
+        lines = [f"好的，帮您查到 {len(matched)} 条~ 明细在下方卡片里"]
+        if total > len(matched):
+            lines.append(f"（范围内共 {total} 条，这里显示最近 {len(matched)} 条；"
+                         "查更早的单请提供单号）")
+        if str(data.get("scope") or "") == "mine":
+            lines.append("💡 以上只包含您本人的单据。")
+        lines.append("💡 有驳回单建议联系审核人，待审核请耐心等待审批~")
+        result["answer"] = "\n".join(lines)
         return result
 
     #便捷构造

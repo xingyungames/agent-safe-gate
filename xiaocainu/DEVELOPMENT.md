@@ -26,7 +26,7 @@
   - **A 政策咨询**：检索增强（BM25）+ LLM 问答。
   - **B 填单引导**：本地正则抽取 + 多轮追问 + 飞书回写。
   - **C 合规预审**：本地规则判定（合规/风险/不合规）+ 合规时回写飞书。
-  - **D 进度查询**：飞书查询（按 申请人 / 单号）。
+  - **D 进度查询**：经主服务器查报销单（按 申请人 / 单号），按提交时间倒序展示最近 50 条。
 
 > 模型要求提示：BM25 **不算 AI 模型**；RAG 类要落到「真·AI 调用」（reranker / embedding）才算一类。当前用 **云端 LLM（DeepSeek/Agnes）+ 可插拔 reranker** 即可满足 ≥2 类，无需本地模型。
 
@@ -58,7 +58,9 @@
 xiaocainu/
 ├── api/                      # M5 API 网关
 │   ├── __init__.py
-│   ├── main.py               # FastAPI 应用 + pydantic 契约 + dispatch（守卫集成 + 分支路由）
+│   ├── main.py               # FastAPI 应用 + pydantic 契约 + dispatch（认证墙 + 守卫 + 分支路由）
+│   ├── auth_service.py       # 账号编排：调主服务器登录/查身份 + 身份缓存
+│   ├── backend_client.py     # 主服务器适配器（无状态透传 + 请求签名 + 错误分类）
 │   └── session.py            # SessionStore：内存级多轮会话 + 跨轮草稿，TTL 过期不落库
 ├── models/                   # M1–M4 核心逻辑（纯 stdlib 为主）
 │   ├── __init__.py           # 包导出 + 自动 load_env()
@@ -66,7 +68,8 @@ xiaocainu/
 │   ├── env.py                # 极简 .env 加载器（stdlib，无 python-dotenv）
 │   ├── llm.py                # M1 LLM 适配器（OpenAI 兼容，可切换 provider）
 │   ├── retriever.py          # M2 BM25 检索（标题切块 / 相关度截断 / 可插拔 rerank·compress / category）
-│   ├── feishu.py             # M3 飞书 Bitable 客户端（urllib）+ 报销单 schema + 写回/屏蔽
+│   ├── feishu.py             # M3 飞书 Bitable 客户端（urllib）+ 枚举常量 + 发票附件上传（不建单不查单）
+│   ├── actor.py              # M8 登录主体与权限键（身份来自主服务器）
 │   └── agent.py              # M4 编排路由层（XiaoCaiAgent：A/B/C/D 路由 + 抽取 + 软提示）
 ├── security/                 # M7 边界防御
 │   ├── __init__.py
@@ -103,7 +106,7 @@ xiaocainu/
 | **M5 API 网关** | `api/main.py` `api/session.py` `api/auth_service.py` | FastAPI：JSON 契约（入口防注入）+ 守卫集成 + 分支路由 + 内存会话 + 前端托管 + **认证墙** | fastapi/uvicorn | `dispatch()`（与框架解耦，可单测）；`SessionStore`；`AuthService` |
 | **M6 前端** | `frontend/index.html` | 原生聊天 UI：渲染 answer / D 记录卡片；**登录遮罩 + 角色 chip + 401 拦截**；只连同源网关 | 无 | 调 `/login` `/logout` `/chat` |
 | **M7 安全守卫** | `security/guard.py` | 输入净化 + prompt 注入拦截 + 按会话限流（双闸第二道）；`would_allow` 只读预检供登录限流复用 | 纯 stdlib | `sanitize_text()` / `check_injection()` / `RateLimiter.allow/would_allow` |
-| **M8 账号认证** | `security/auth.py` `models/users.py` `tools/user_admin.py` | **纯 stdlib 认证**：PBKDF2 密码哈希（随机盐 100k 迭代）+ HMAC 签名 token（exp/jti、恒时比较）+ 内存 jti 黑名单；飞书用户表读取（60s 缓存）；管理员 CLI（add/reset/disable/enable/list） | 纯 stdlib | `hash_password()` / `verify_password()` / `issue_token()` / `verify_token()` / `TokenRevoker`；`UserStore` / `authenticate()`；CLI `python tools/user_admin.py` |
+| **M8 账号认证** | `models/actor.py` `api/auth_service.py` | **账号唯一来源是主服务器 C#**：网关不再保存任何账号库，登录只调 `POST /api/auth/login`，请求校验只调 `GET /api/auth/me`（按令牌摘要缓存 + 失效负缓存）；角色判断一律看主服务器下发的权限键 | 主服务器 HTTP | `Actor` / `build_actor()` / `Actor.can()`；`AuthService.login/authenticate/logout` |
 | **M9 发票 OCR** | `models/ocr.py` + 网关 `/ocr` + `models/feishu.upload_attachment` | **DeepSeek 视觉多模态**（`deepseek-flash`，OpenAI 兼容 image_url base64）：发票图 → 结构化字段（金额/开票日期/号码/销售方/类型/城市，枚举白名单校验）；确认提交后图片经 stdlib multipart 上传飞书「发票附件」列与单据关联；图片仅内存中转不落盘 | openai（视觉调用） | `InvoiceOCREngine.extract()` / `MockOcrEngine`；`build_invoice_preview()`；`FeishuBitableClient.upload_attachment()`；`POST /ocr` |
 
 **设计原则**：
@@ -164,7 +167,7 @@ xiaocainu/
 | **A 咨询** | `_handle_consult` | `retriever.query` → `format_context` → `llm.chat`（带 history 多轮） | 是（仅 A） | 否 |
 | **B 填单** | `_handle_fill` | `_extract_fields`（本地正则）→ `_merge_draft` 跨轮补全 → 缺必填（**申请人/部门/报销类型/金额**）则 `_ask_missing` → 必填齐则进入**「确认前核对」态**（`_ask_confirm` 回显参数 + 票据主要提醒 + 软提醒，`await_confirm=True`）→ 用户回「确认提交」才 `_do_submit`（`build_reimbursement_record` → `create_records` → `_fetch_bill_no` 真实单号回显） | 否（本地规则） | 是（**确认后**） |
 | **C 合规** | `_handle_compliance` | `_extract_fields` → `_compliance_check`（阈值规则）→ 合规且信息齐 → 回写飞书（状态 待审核） | 否 | 是（齐后，阻断/风险不写） |
-| **D 进度** | `_handle_progress` | 抽 单号/申请人 → `list_records` 全表拉取 → 字段包含匹配 → `public_view` 屏蔽内部键 → 结构化卡片 | 否 | 读 |
+| **D 进度** | `_handle_progress` | 抽 单号/申请人 → 调主服务器 `GET /api/invoice/list`（范围由服务端按角色裁剪） → `_csharp_row_view` 转中文键 → 按提交时间**倒序** → 取最近 `_D_LIST_LIMIT`(50) 条；**`answer` 只给一句摘要**（查到 N 条 + 截断/范围提示），明细统一由前端 `res.records` 卡片渲染，避免同一批单据显示两遍 | 否 | 读 |
 
 ### 5.4 意图路由规则（关键词瀑布，零模型调用）
 
@@ -187,9 +190,15 @@ B 分支**不直接落表**，而是两段式：
 3. **无票软确认（C 方案，不硬拦截）**：确认提交时若合规层判「阻断」且为无票——第一次先回 `_ask_no_invoice_confirm` 二选一（🧾 回复「有发票了」补票 / 🚀 回复「仍要提交」坚持），草稿记 `no_invoice_warned=True`；用户坚持则放行写表，`_do_submit` 以覆盖参数写入 `合规结果=驳回`、`风险摘要=无票提交（用户确认坚持），财务将驳回`（「驳回」为真实表单选已有选项）。用户回「有发票了」→ 票据状态更新为有票并清除标记，回到正常确认摘要，提交不再标驳回。
 
 **提醒分级**：
-- **必填**：申请人 / **部门（已升级为必填）** / 报销类型(4 类) / 金额。缺任意一项走 `_ask_missing`。
+- **必填**：申请人 / 部门 / 报销类型(4 类) / 金额 / **事由（2–200 字，与主服务器校验口径一致）** / **票据（必须为「有票」）**。缺任意一项走 `_ask_missing`，**不会带着缺项去调主服务器**。
+- **票据双闸**：① `_handle_fill` 把「票据非有票」当缺项，无票/未提都进不了确认卡；② `_do_submit` 再挡一次（`has_invoice != "有票"` 直接返回，不调主服务器）。主服务器与飞书字段不变，仍保留「未提只记风险」的口径，只是网关不再放行。
 - **主要提醒（礼貌，区别于软提醒）**：票据状态——「有发票会加快审核进度，无发票需要更多核验时间」（`_invoice_reminder`，在追问与确认两处都出现）。
-- **软提醒（非必填，礼貌）**：事由 / 差旅城市（`_soft_hints`），仅建议补充。
+- **软提醒（非必填，礼貌）**：差旅城市（`_soft_hints`），仅建议补充。
+- **事由承接**：追问事由时草稿置 `await_reason=True`；下一句先**剔除已被部门/类型/城市/金额/票据消费掉的词**（`_reason_from_answer`），剩下的才当事由。剔除后不足 2 字则继续追问，**不再整句硬塞**。例：「财务部 交通费 200元 通勤」→ 部门/类型/金额照常入草稿，事由只取「通勤」。
+- **票据状态**：**图片证据优先** —— OCR 识别出发票号即判「有票」，即使口述说「没发票」也会被纠正（避免「传了票却被判无票而阻断」）；没识别出票号时才按口述取 有票/无票/未提。
+- **确认卡风险前置**：`_ask_confirm` 先跑一次 `_compliance_check`，风险用「⚠️ 风险提示」提前告知，阻断用「🚫」并改用「补齐发票后回复我」收尾（不再邀请「确认提交」），避免提交后才被打回。
+- **票据提醒去重**：只有「无票」「未提」才追加 `_invoice_reminder`；已阻断时上面那句已说明原因、不再重复；无票/未提的提醒会引导用户「上传发票，或上传详细的支付凭证（微信/支付宝「账单详情」页）」；「有票」只在「已记录」里出现一次。文案统一不暴露「上传飞书」这类内部实现细节。
+- **前端按权限收敛文案**：欢迎语 `welcomeHtml()`、顶部副标题、意图标签 `intentLabel()` 都读 `perms`，没有 `invoice.review` 的账号完全看不到「合规预审」字样（按钮、副标题、欢迎语、气泡标签四处一致）。
 
 ### 5.5 飞书写/读链路（含关键坑）
 
@@ -233,9 +242,8 @@ B 分支**不直接落表**，而是两段式：
 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 飞书自建应用凭证 | **敏感，勿提交** |
 | `FEISHU_APP_TOKEN` | 多维表格 base id（app_token） | 敏感 |
 | `FEISHU_TABLE_ID` | 报销单主表 `tbl...`（例 `<报销单主表_table_id>`；建好 V2 企业级表后换成新表 id） | 敏感表 id |
-| `FEISHU_USER_TABLE_ID` | **M8 用户表** `tbl...`（账号/角色/密码哈希存这张表） | 未配置 → 认证墙 fail-closed（全部 401） |
-| `AUTH_SECRET` | **M8 HMAC 签名密钥**（生成：`python -c "import secrets;print(secrets.token_hex(32))"`） | **敏感**；缺失则启动用临时密钥并告警（重启全体掉线） |
-| `AUTH_TOKEN_TTL` | token 有效期秒数（默认 7200=2h） | |
+| `BACKEND_BASE_URL` | **必填**：主服务器地址（如 `http://127.0.0.1:8899`） | 为空 → 认证墙关闭，受保护端点与登录一律 503（fail-closed） |
+| `BACKEND_TIMEOUT` | 调主服务器单次超时秒数（默认 20） | 列表拉 500 条时给足时间 |
 | `AUTH_LOGIN_LIMIT` / `AUTH_LOGIN_WINDOW` | 登录限流：失败次数上限 / 窗口秒（默认 5 次/300s，**仅失败计数**） | |
 | `KNOWLEDGE_DIR` | 知识库目录（默认 `knowledge`） | 可选 |
 | `OCR_BASE_URL` / `OCR_API_KEY` / `OCR_MODEL` | **M9 发票 OCR**：默认回落 `DEEPSEEK_BASE_URL/DEEPSEEK_API_KEY`，模型默认 `deepseek-flash`（官方视觉，legacy `deepseek-v4-flash-vision-exp` 自动路由） | 填好 DeepSeek key 即用，无需单独申请 |
@@ -293,10 +301,26 @@ B 分支**不直接落表**，而是两段式：
 
 **枚举强校验（代码层，M8 白名单）**：`models/feishu.py` 集中定义企业标准枚举常量（`DEPT_WHITELIST` 11 / `CITY_WHITELIST` 37 / `ALLOWED_TYPES` 4 / `ALLOWED_INVOICE` 3 / `COMPLIANCE_RESULTS` 4 / `STATUS_VALUES` 4）+ `validate_enum_fields(record)` 写前闸门。**两份清单（部门/城市）即飞书单选选项，代码与表逐字一致，唯一定义源在 `feishu.py`**。抽取层 `models/agent.py._extract_fields` 做**字段级归一路由**：城市只认 `CITY_WHITELIST`；部门经 `normalize_department` 把模糊输入（研发部门/研发/技术部）显式映射到字典，无法确定则留空由机器人追问；落库前 `_do_submit`/`_handle_compliance` 必过 `validate_enum_fields`，任何非标准枚举值（如「火星部」「电脑部门」）一律**拒写并友好提示**，杜绝脏值入表。
 
-### 6.6 M8 认证与用户表（`security/auth.py` + `models/users.py` + `tools/user_admin.py`）
+### 6.6 M8 账号认证（`models/actor.py` + `api/auth_service.py`）
+
+> 账号体系已统一到主服务器：飞书用户表下线，网关不再保存账号、不再签发自己的令牌。
+> 设计与取舍详见 `docs/账号统一改造-RFED_CAC.md`。
 
 | 项 | 规格 |
 |----|------|
+| 账号来源 | 只有主服务器 `POST /api/auth/login`；网关侧无任何本地/飞书账号库 |
+| 会话凭证 | **透传主服务器 token**：浏览器持有 C# 签发的 JWT，网关不签发、不改写 |
+| 身份获取 | `sha256(token)` 查内存缓存 → 未命中先本地判 `exp` → 再调 `GET /api/auth/me` |
+| 缓存策略 | 命中缓存零请求；失效能负缓存 30s（避免拿废令牌反复打主服务器累积攻击分） |
+| 签名密钥 | 从 JWT 载荷的 `sk` 取，**只在服务端使用，绝不回传浏览器** |
+| 角色判断 | 不看中文角色串，只看权限键：`invoice.submit` / `invoice.read.all` / `invoice.review` |
+| 登录限流 | 网关侧 `RateLimiter`，key=`用户名\|IP`，默认 5 次/300s，**仅失败计数**；主服务器另有自己的限流 |
+| 锁定口径 | 主服务器按 **`用户名\|IP` 组合**计数（组合锁），只有同源持续失败才限制；网关登录时带 `X-Client-Ip`，主服务器仅在受信来源时采信，防伪造 |
+| sid 绑定 | `sid_bindings: dict[sid→主服务器 user.id]`：sid 首次出现即绑定，同 sid 换用户 → 403 |
+| 登出 | 主服务器不做令牌吊销，网关只清本地缓存（令牌在过期/改密/改角色前仍有效） |
+| 未知/空角色 | 按权限键判定，无权限即拒绝；不再有「默认降级为员工」的隐式放行 |
+
+----|------|
 | 密码哈希 | PBKDF2-HMAC-SHA256，每用户随机 16 字节盐、100k 迭代；`hmac.compare_digest` 恒时比较 |
 | Token | `base64url(payload).b64url(HMAC-SHA256)`；含 `iat/exp/jti`；TTL≤2h；登出 = 内存 jti 黑名单 |
 | 登录限流 | 复用 `RateLimiter`，key=`用户名\|IP`，5 次/300s；**仅失败计数**（`would_allow` 预检 + 失败才 `allow`） |
@@ -346,15 +370,15 @@ python run_live.py        # 用 venv 解释器；无 openai 时 A 降级 mock，
 # 用 venv 解释器逐个跑（pytest 未装进 venv 时直接 python 执行）
 "C:\Users\Administrator\.workbuddy\binaries\python\envs\default\Scripts\python.exe" tests/test_agent.py
 "C:\Users\Administrator\.workbuddy\binaries\python\envs\default\Scripts\python.exe" tests/test_feishu.py
-# ... 共 11 个 test_*.py 全过（含 M8 的 test_auth.py / test_users.py、M9 的 test_ocr.py）
+# ... 共 10 个 test_*.py 全过（含账号链路的 test_backend_authority.py、M9 的 test_ocr.py）
 ```
 
 ### 7.5 部署注意事项
 - 网关进程**跨轮不常驻**：agent 会话里 `run_in_background` 起的进程不会持久；用户需在自己终端里起 `run_server.bat` 才能持续访问。
 - 凭证只服务端读取；前端登录 token 仅存 sessionStorage（关标签即清）；`.env` 已被 `.gitignore` 排除。
-- **M8 上线三步**：① 按 `docs/TABLE_SETUP.md` 建用户表+主表V2 → ② `.env` 填 `FEISHU_USER_TABLE_ID`/`AUTH_SECRET` → ③ `tools/user_admin.py add` 录 3 个演示账号（员工/财务/管理员）。
+- **M8 上线三步**：① 起主服务器 `dotnet run`（账号权威在它那边）→ ② `.env` 填 `BACKEND_BASE_URL` → ③ 用 C# 管理后台创建账号（网关不再建号）。
 - **M9 上线三步**：① 主表补「发票信息」「发票附件」两列（TABLE_SETUP 手册 1 分钟）→ ② `.env` 填真实 `DEEPSEEK_API_KEY`（顺带 `DEEPSEEK_MODEL=deepseek-flash`）→ ③ 上传一张真实发票照片冒烟（识别→预填→提交→附件落库）。
-- 演示后轮换 `AUTH_SECRET`（泄露=可伪造任意角色 token）。
+- 主服务器令牌有效期由 C# `Security:TokenMinutes` 控制（默认 120 分钟）；改密/改角色/停用会让旧令牌立即失效。
 
 ---
 

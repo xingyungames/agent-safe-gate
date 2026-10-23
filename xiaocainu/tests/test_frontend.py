@@ -20,20 +20,35 @@ def test_frontend_file_exists():
     assert "/login" in content and "Authorization" in content, "前端应实现登录与 Bearer 头"
     assert "sessionStorage" in content, "token 应存 sessionStorage（刷新不掉线、关标签即清）"
     assert "401" in content, "应有登录过期统一拦截"
+    assert "xc_perms" in content, "前端应保存主服务器下发的权限键"
+    assert "/me" in content, "启动时应调用 /me 校验登录态"
+    #按权限收敛文案：没有预审权限的账号不该看到「合规预审」入口
+    assert "welcomeHtml" in content, "欢迎语应按权限拼装，不能写死"
+    assert "appSubtitle" in content, "顶部副标题应随权限变化"
+    assert "intentLabel" in content, "意图标签应按权限显示"
+    #多行发送后输入框要收回高度 否则会一直留空白
+    assert "resetInputHeight" in content, "发送后应重置输入框高度"
+    assert 'inputEl.value = "";\n    resetInputHeight();' in content, "清空输入后必须同步收回高度"
     print("[PASS] test_frontend_file_exists")
 
 
 class _FakeAuth:
-    #认证墙离线替身 固定测试用户
+    #认证墙离线替身 固定测试用户（财务）
 
-    def verify(self, token):
-        #固定 token 返回测试用户
+    def authenticate(self, token):
+        #固定 token 返回测试主体
+        from models.actor import build_actor
         if token == "tok-t":
-            return {"username": "tester", "name": "测试员", "role": "财务",
-                    "department": "测试部", "employee_id": "T001"}
+            return build_actor(
+                {"id": "u_t", "userName": "tester", "displayName": "测试员",
+                 "employeeId": "T001", "role": "finance", "roleLabel": "财务部",
+                 "permissions": [{"key": "invoice.review", "label": "审核报销单"},
+                                 {"key": "invoice.read.all", "label": "查询全部报销单"},
+                                 {"key": "invoice.submit", "label": "提交报销单"}]},
+                token="tok-t", sign_key="sk-t")
         return None
 
-    def bind_sid(self, sid, username):
+    def bind_sid(self, sid, user_key):
         #绑定会话直接成功
         return True, ""
 

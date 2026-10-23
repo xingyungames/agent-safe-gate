@@ -235,7 +235,9 @@ class InvoiceOCREngine:
 
         parsed = extract_json(text)
         if str(parsed.get("error", "")).strip() == "not_invoice":
-            raise OCRError("图片不是发票/收据/消费凭证")
+            raise OCRError(
+                "没识别出报销要素，请上传相关发票，或更清晰的支付凭证截图"
+                "（微信/支付宝「账单详情」页）")
 
         fields, warnings = sanitize_fields(parsed)
         usage = {}

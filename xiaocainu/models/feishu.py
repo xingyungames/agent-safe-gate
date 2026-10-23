@@ -7,7 +7,6 @@ import time
 import json as _json
 import urllib.request
 import urllib.parse
-from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Protocol, runtime_checkable
 
 
@@ -359,92 +358,3 @@ CITY_TIER.update({c: 250 for c in _CITY_T3})
 ALLOWED_INVOICE = ("有票", "无票", "未提")
 COMPLIANCE_RESULTS = ("通过", "风险", "驳回", "超2000需总经理审批")
 STATUS_VALUES = ("待审核", "审核中", "已通过", "已驳回")
-
-
-def validate_enum_fields(record: dict) -> list:
-    #返回非法字段值 空即全合法
-    errors = []
-    for field, allowed in (
-        ("部门", DEPT_WHITELIST),
-        ("城市", CITY_WHITELIST),
-        ("报销类型", ALLOWED_TYPES),
-        ("票据状态", ALLOWED_INVOICE),
-        ("合规结果", COMPLIANCE_RESULTS),
-        ("状态", STATUS_VALUES),
-    ):
-        v = record.get(field)
-        if v and v not in allowed:
-            errors.append((field, v))
-    return errors
-
-COMPANY_NAME = "示例科技有限公司"  #占位 比赛替换真实公司名
-
-
-def _parse_date_to_ts(date_str):
-    #日期转东八区当天零点毫秒
-    if not date_str:
-        return None
-    s = str(date_str).strip()
-    cn = timezone(timedelta(hours=8))  #固定东八区 避免时区漂移
-    for fmt in ("%Y/%m/%d", "%Y-%m-%d", "%Y.%m.%d", "%Y年%m月%d日", "%Y%m%d"):
-        try:
-            dt = datetime.strptime(s, fmt).replace(tzinfo=cn)
-            return int(dt.timestamp() * 1000)
-        except ValueError:
-            continue
-    return None
-
-
-def build_reimbursement_record(
-    *,
-    applicant: str = "",
-    department: str = "",
-    rtype: str = "",
-    amount=0,
-    reason: str = "",
-    has_invoice: str = "",
-    city: str = "",
-    date_str: str = "",
-    compliance: str = "",
-    risk_summary: str = "",
-    status: str = "待审核",
-    employee_id: str = "",
-) -> dict:
-    #拼报销单字段字典
-    now_ts = int(time.time() * 1000)
-    invoice_ts = _parse_date_to_ts(date_str) or now_ts
-    try:
-        amount_val = float(amount)
-    except (TypeError, ValueError):
-        amount_val = 0.0
-    rec = {
-        "申请人": applicant,
-        "部门": department,
-        "报销类型": rtype,
-        "金额": amount_val,
-        "事由": reason,
-        "票据状态": has_invoice,
-        "状态": status,
-        "城市": city,
-        "发票日期": invoice_ts,
-        "记录提交时间": now_ts,
-        "合规结果": compliance,
-        "风险摘要": risk_summary,
-    }
-    if employee_id:
-        rec["工号"] = employee_id
-    return rec
-
-
-def public_view(record: dict) -> dict:
-    #只留业务字段给聊天层
-    fields = record.get("fields", {})
-    return {k: v for k, v in fields.items() if k in REIMBURSEMENT_FIELDS}
-
-
-def filter_by_schema(record: dict, available_fields) -> dict:
-    #按真实表字段过滤 剔除未知键
-    allow = set(available_fields or ())
-    if not allow:
-        return record
-    return {k: v for k, v in record.items() if k in allow}

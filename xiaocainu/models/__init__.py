@@ -20,6 +20,7 @@ from .retriever import (
 )
 from .config import get_provider_config, knowledge_dir
 from .agent import XiaoCaiAgent
+from .actor import Actor, build_actor
 from .feishu import (
     FeishuBitableClient,
     FeishuError,
@@ -27,8 +28,6 @@ from .feishu import (
     UrllibTransport,
     REIMBURSEMENT_FIELDS,
     ALLOWED_TYPES,
-    build_reimbursement_record,
-    public_view,
 )
 
 __all__ = [
@@ -47,12 +46,12 @@ __all__ = [
     "get_provider_config",
     "knowledge_dir",
     "XiaoCaiAgent",
+    "Actor",
+    "build_actor",
     "FeishuBitableClient",
     "FeishuError",
     "FeishuTransport",
     "UrllibTransport",
     "REIMBURSEMENT_FIELDS",
     "ALLOWED_TYPES",
-    "build_reimbursement_record",
-    "public_view",
 ]

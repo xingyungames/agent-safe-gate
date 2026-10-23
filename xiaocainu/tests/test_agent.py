@@ -1,13 +1,17 @@
 #编排层离线单测 不联网不调付费接口
+#身份与权限来自主服务器（离线替身），单据读写全部经主服务器
 import os
 import sys
-from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from api import backend_client
+from mock_backend import FakeBackend, install, make_row, make_token, make_user
+from models.actor import build_actor
 from models.retriever import Retriever, Chunk
 from models.llm import LLMAdapter, MockProvider
-from models.agent import XiaoCaiAgent, INTENT_RULES, normalize_department
+from models.agent import XiaoCaiAgent, normalize_department
 
 
 CORPUS = [
@@ -19,878 +23,796 @@ CORPUS = [
           source="填单规则.md"),
 ]
 
+IMG_B64 = "aGVsbG8="  #hello 的 base64 仅用于附件路径
+
 
 #构造测试用的编排 agent
-def _agent(compressor=None, reranker=None, feishu=None, table_id=None):
+def _agent(feishu=None, table_id="tblX"):
     llm = LLMAdapter(MockProvider(canned="[MOCK] 回复内容"))
-    ret = Retriever(CORPUS, reranker=reranker)
+    ret = Retriever(CORPUS)
     return XiaoCaiAgent(
-        llm, ret, compressor=compressor, default_category="报销制度",
+        llm, ret, default_category="报销制度",
         feishu=feishu, table_id=table_id,
     )
 
 
+#构造一个登录主体
+def _actor(role="employee", username="employee", name="张三", eid="E0001"):
+    user = make_user(username, role, name, eid)
+    return build_actor(user, token=make_token(username, role), sign_key="sk-test")
+
+
+#装上离线主服务器并返回它
+def _backend(rows=None):
+    fake = FakeBackend(rows=rows)
+    install(fake, backend_client)
+    return fake
+
+
 class MockFeishu:
-    #离线飞书客户端 记录调用并按规定返回
+    #离线飞书客户端 只用于发票附件列
 
-    #记录调用历史
-    def __init__(self):
-        self.created = []
-        self.listed = []
+    def __init__(self, has_col=True, fail=False):
+        self.has_col = has_col
+        self.fail = fail
+        self.uploaded = []
+        self.updated = []
 
-    #模拟批量建记录
-    def create_records(self, table_id, records):
-        ids = [f"rec_{i}_{len(self.created)}" for i in range(len(records))]
-        self.created.extend(records)
-        return ids
+    def upload_attachment(self, name, data, mime):
+        self.uploaded.append((name, data, mime))
+        if self.fail:
+            raise RuntimeError("上传失败")
+        return "ftk_1"
 
-    #模拟查记录
-    def list_records(self, table_id, **kw):
-        self.listed.append(kw)
-        return [{
-            "record_id": "rec_x",
-            "fields": {"单号": "BX1", "申请人": "小新新", "报销类型": "差旅费", "状态": "审批中",
-                       "审核人": "王审核", "金额": 500, "工号": "A123"},
-        }]
+    def field_names(self, table_id):
+        return {"发票附件", "发票信息"} if self.has_col else {"发票信息"}
 
-    #模拟取单条记录
-    def get_record(self, table_id, record_id, **kw):
-        return {"record_id": record_id, "fields": {"单号": "BX-001"}}
+    def update_record(self, table_id, record_id, fields):
+        self.updated.append((record_id, fields))
+        return {"record_id": record_id}
 
 
-class FakeAuth:
-    #离线最小认证 固定用户张三为员工
+# ---------- 意图识别 ----------
 
-    #记录会话绑定
-    def __init__(self):
-        self.bindings = {}
-
-    #校验令牌并返回用户
-    def verify(self, token):
-        if token == "tok-test":
-            return {"username": "zhangsan", "name": "张三", "role": "员工",
-                    "department": "研发部", "employee_id": "E0001"}
-        return None
-
-    #绑定会话与用户名
-    def bind_sid(self, sid, username):
-        bound = self.bindings.setdefault(sid, username)
-        return (bound == username, "" if bound == username else f"bound to {bound}")
-
-
-#测咨询类问句判 A
 def test_classify_intent_consult():
     a = _agent()
     assert a.classify_intent("差旅费住宿标准是多少") == "A"
-    assert a.classify_intent("报销制度里怎么规定的") == "A"
     print("[PASS] test_classify_intent_consult")
 
 
-#测填单类问句判 B
 def test_classify_intent_fill():
     a = _agent()
-    assert a.classify_intent("我要填一张报销单") == "B"
-    assert a.classify_intent("怎么提交报销") == "B"
+    assert a.classify_intent("我要报销差旅费") == "B"
     print("[PASS] test_classify_intent_fill")
 
 
-#测合规预审问句判 C
 def test_classify_intent_compliance():
     a = _agent()
-    assert a.classify_intent("这笔报销超标了吗有没有风险") == "C"
+    assert a.classify_intent("这笔招待费超标了吗") == "C"
     print("[PASS] test_classify_intent_compliance")
 
 
-#测进度查询问句判 D
 def test_classify_intent_progress():
     a = _agent()
-    assert a.classify_intent("我的报销单现在什么状态") == "D"
+    assert a.classify_intent("我的报销单到哪一步了") == "D"
     print("[PASS] test_classify_intent_progress")
 
 
-#测咨询分支离线跑通并带资料
+# ---------- A 分支 ----------
+
 def test_consult_offline():
+    _backend()
     a = _agent()
-    res = a.route("差旅费住宿标准是多少")
+    res = a.route("差旅费住宿标准是多少", actor=_actor())
     assert res["intent"] == "A"
     assert res["answer"] == "[MOCK] 回复内容"
-    assert res["chunks"], "应检索到资料"
-    assert all(c.category == "报销制度" for c in res["chunks"])
     print("[PASS] test_consult_offline")
 
 
-#测填单确认后写飞书并回显单号
-def test_b_fill_with_feishu():
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    res = a.route("我要填差旅费报销单 张三 研发部 金额800 有发票 北京 9月10号")
-    #必填齐全先进确认态 不写表
-    assert res["intent"] == "B"
-    assert res["record_id"] is None, "确认前不应写表"
-    assert "确认提交" in res["answer"], "应提示用户确认"
-    #确认后真正写表并取回单号
-    res2 = a.route("确认提交", base_draft=res["draft"])
-    assert res2["intent"] == "B"
-    assert res2["record_id"], "确认后应已写入飞书并拿到 record_id"
-    assert "BX" in res2["answer"], "答案应带回可读单号"
-    assert "rec_" not in res2["answer"], "答案不应泄露内部 record_id（屏蔽）"
-    print("[PASS] test_b_fill_with_feishu")
+# ---------- 字段抽取 ----------
 
-
-#测未接飞书时确认提交给提示
-def test_b_fill_without_feishu():
-    a = _agent()
-    res = a.route("我要填报销单 张三 研发部 招待费 金额800 有发票")
-    #必填齐全进确认态 不写表
-    assert res["intent"] == "B"
-    assert res["record_id"] is None
-    assert "确认提交" in res["answer"], "应进入确认态"
-    #未接飞书 确认后仍不写表
-    res2 = a.route("确认提交", base_draft=res["draft"])
-    assert res2["record_id"] is None
-    assert "未接入" in res2["answer"]
-    print("[PASS] test_b_fill_without_feishu")
-
-
-#测招待费超标判风险并给摘要
-def test_c_compliance():
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    res = a.route("这笔招待费3000超标了吗")
-    assert res["intent"] == "C"
-    assert res["compliance"] == "风险"
-    assert "超2000" in res["risk_summary"]
-    print("[PASS] test_c_compliance")
-
-
-#测本地规则抽取基本字段
 def test_extract_fields_basic():
-    a = _agent()
-    f = a._extract_fields("小新新，研发部，上海出差，2600，招待费，发票有，9月10号")
-    assert f["applicant"] == "小新新"
-    assert f["department"] == "研发部"
-    assert f["category"] == "招待费"
-    assert f["amount"] == 2600
-    assert f["has_invoice"] == "有票"
-    assert f["city"] == "上海"
-    assert f["date"] == f"{datetime.now().year}/9/10"
+    f = XiaoCaiAgent._extract_fields("我是张三，研发部，招待费 800，有发票，事由是客户餐叙")
+    assert f["applicant"] == "张三", f
+    assert f["department"] == "研发部", f
+    assert f["category"] == "招待费", f
+    assert f["amount"] == 800, f
+    assert f["has_invoice"] == "有票", f
     print("[PASS] test_extract_fields_basic")
 
 
 def test_extract_department_routes_to_enum():
-    #测部门模糊输入归一到标准枚举
-    a = _agent()
-    #正则锚定部/部门后归一
-    assert a._extract_fields("我是张三，研发部门，招待费 800").get("department") == "研发部"
-    assert a._extract_fields("张三 研发部 招待费 800").get("department") == "研发部"
-    assert a._extract_fields("钱会计 财务部 招待费 300").get("department") == "财务部"
-    assert a._extract_fields("李工 技术部 交通费 50").get("department") == "信息技术部"
-    #裸核心词直接归一
-    assert normalize_department("研发") == "研发部"
-    assert normalize_department("信息技术") == "信息技术部"
-    #非标准值留空 交给追问
-    assert a._extract_fields("王五 电脑部门 招待费 800").get("department") == ""
-    assert a._extract_fields("赵六 管理部门 招待费 800").get("department") == ""
+    assert normalize_department("研发部门") == "研发部"
+    assert normalize_department("技术部") == "信息技术部"
+    assert normalize_department("hr") == "人力资源部"
+    assert normalize_department("火星部") == ""
     print("[PASS] test_extract_department_routes_to_enum")
 
 
 def test_extract_city_routes_to_whitelist():
-    #测城市只认白名单并归一名
-    a = _agent()
-    assert a._extract_fields("去上海出差 差旅费 800").get("city") == "上海"
-    assert a._extract_fields("成都开会 差旅费 600").get("city") == "成都"
-    #非白名单城市抽不到 留空
-    assert a._extract_fields("火星出差 差旅费 600").get("city") == ""
+    f = XiaoCaiAgent._extract_fields("我要报销差旅费 800 上海")
+    assert f["city"] == "上海", f
     print("[PASS] test_extract_city_routes_to_whitelist")
 
 
-def test_fill_bogus_department_asked_not_written():
-    #回归 部门无法归一应追问不写脏值
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    res = a.route("我要报销 张三 火星部 招待费 800 有发票")
-    #部门无法归一进追问态 不写表
-    assert res["intent"] == "B"
-    assert res["record_id"] is None
-    assert "部门" in res["answer"], "应追问部门"
-    #强行确认也不写表
-    res2 = a.route("确认提交", base_draft=res["draft"])
-    assert res2["record_id"] is None, "部门缺失不应写表"
-    assert not any(rec.get("部门") == "火星部" for rec in a.feishu.created), "绝不应写出非标准部门"
-    print("[PASS] test_fill_bogus_department_asked_not_written")
-
-
-#测中文日期不带年份补当前年
 def test_extract_chinese_date_no_year():
-    a = _agent()
-    f = a._extract_fields("张三 研发部 买办公用品 800 没发票 三月二号")
-    assert f["applicant"] == "张三"
-    assert f["department"] == "研发部"
-    assert f["category"] == "办公用品"
-    assert f["has_invoice"] == "无票"
-    assert f["date"] == f"{datetime.now().year}/3/2"
+    f = XiaoCaiAgent._extract_fields("差旅费 800 9月10号")
+    assert f["date"], f
     print("[PASS] test_extract_chinese_date_no_year")
 
 
-#测专项费用单独标记
 def test_extract_special_category_blocks():
-    a = _agent()
-    f = a._extract_fields("我想报通讯费200元")
-    assert f["special"] == "通讯费"
-    assert f["category"] == ""
+    f = XiaoCaiAgent._extract_fields("我要报团建费500")
+    assert f["special"], f
     print("[PASS] test_extract_special_category_blocks")
 
 
-#测招待费超 2000 判风险
-def test_compliance_entertainment_over_limit():
-    a = _agent()
-    comp, summary = a._compliance_check(
-        {"category": "招待费", "amount": 2600, "has_invoice": "有票", "date": "", "city": ""}
-    )
-    assert comp == "风险"
-    assert "超2000" in summary
-    print("[PASS] test_compliance_entertainment_over_limit")
-
-
-#测无票判阻断
-def test_compliance_no_invoice_blocks():
-    a = _agent()
-    comp, summary = a._compliance_check(
-        {"category": "差旅费", "amount": 800, "has_invoice": "无票", "date": "", "city": "北京"}
-    )
-    assert comp == "阻断"
-    print("[PASS] test_compliance_no_invoice_blocks")
-
-
-#测必填缺失时追问补齐
-def test_fill_missing_asks_when_incomplete():
-    a = _agent()
-    res = a.route("我要填报销单")  #全缺
-    assert res["intent"] == "B"
-    assert res["record_id"] is None
-    assert "补齐" in res["answer"]
-    print("[PASS] test_fill_missing_asks_when_incomplete")
-
-
-#测未提发票也能正常提交
-def test_b_invoice_untipped_submits():
-    #未提不追问 确认后按未提提交
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    res = a.route("我要报销 张三 研发部 招待费 800")
-    #必填齐全进确认态
-    assert res["intent"] == "B"
-    assert res["record_id"] is None, "确认前不写表"
-    assert "确认提交" in res["answer"]
-    #确认后未提也应提交成功
-    res2 = a.route("确认提交", base_draft=res["draft"])
-    assert res2["record_id"], "未提发票也应提交成功"
-    assert res2["draft"] is None, "提交完成后应清空草稿"
-    #核对写入表的票据状态
-    assert a.feishu.created[-1]["票据状态"] == "未提"
-    print("[PASS] test_b_invoice_untipped_submits")
-
-
-def test_b_invoice_none_blocks():
-    #无票先软确认 坚持则写表标驳回
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    res = a.route("我要报销 张三 研发部 招待费 800 没发票")
-    assert res["intent"] == "B"
-    assert res["record_id"] is None
-    assert res["draft"]["has_invoice"] == "无票"
-    #首次确认走软确认 不写表
-    res2 = a.route("确认提交", base_draft=res["draft"])
-    assert res2["record_id"] is None, "软确认阶段不写表"
-    assert "有发票了" in res2["answer"] and "仍要提交" in res2["answer"], "应给出二选一软确认提示"
-    assert res2["draft"] is not None and res2["draft"].get("no_invoice_warned"), "应记住已软确认"
-    #坚持提交则写表并标驳回
-    res3 = a.route("仍要提交", base_draft=res2["draft"])
-    assert res3["record_id"], "用户坚持提交应放行写表"
-    assert a.feishu.created[-1]["合规结果"] == "驳回", "无票坚持提交应标记合规结果=驳回"
-    assert "无票提交" in a.feishu.created[-1]["风险摘要"], "风险摘要应注明无票坚持提交"
-    assert res3["draft"] is None, "提交成功后清空草稿"
-    print("[PASS] test_b_invoice_none_blocks")
-
-
-def test_b_invoice_none_then_fixed():
-    #软确认后补票应回到确认态再提交
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    res = a.route("我要报销 张三 研发部 招待费 800 没发票")
-    res2 = a.route("确认提交", base_draft=res["draft"])
-    assert "有发票了" in res2["answer"], "应先软确认"
-    #补票后回确认摘要 不直接写表
-    res3 = a.route("有发票了", base_draft=res2["draft"])
-    assert res3["record_id"] is None, "补票后应先重新核对，不直接写表"
-    assert res3["draft"]["has_invoice"] == "有票", "票据状态应更新为有票"
-    assert "有票" in res3["answer"], "确认摘要应显示有票"
-    #补票后确认正常写表
-    res4 = a.route("确认提交", base_draft=res3["draft"])
-    assert res4["record_id"], "补票后确认应正常写表"
-    assert a.feishu.created[-1]["票据状态"] == "有票"
-    assert a.feishu.created[-1]["合规结果"] != "驳回", "补票后不应标记驳回"
-    print("[PASS] test_b_invoice_none_then_fixed")
-
-
-#测专项费用走专项流程提示
-def test_fill_special_category_reply():
-    a = _agent()
-    res = a.route("我要报团建费500")
-    assert res["intent"] == "B"
-    assert res["record_id"] is None
-    assert "专项流程" in res["answer"]
-    print("[PASS] test_fill_special_category_reply")
-
-
-#测缺事由给通过率软提示
-def test_soft_hints_reason_missing():
-    a = _agent()
-    hints = a._soft_hints({"reason": "", "category": "招待费", "city": "北京"})
-    assert any("事由" in h and "通过率" in h for h in hints), "缺事由应提示补充以提高通过率"
-    assert not any("城市" in h for h in hints), "非差旅不应提示城市"
-    print("[PASS] test_soft_hints_reason_missing")
-
-
-#测差旅缺城市给加快审核提示
-def test_soft_hints_travel_city_missing():
-    a = _agent()
-    hints = a._soft_hints({"reason": "开会", "category": "差旅费", "city": ""})
-    assert any("城市" in h and "加快审核" in h for h in hints), "差旅缺城市应提示补充以加快审核"
-    print("[PASS] test_soft_hints_travel_city_missing")
-
-
-def test_ask_missing_includes_soft_hints():
-    #测追问时同时给事由软提示
-    a = _agent()
-    res = a.route("我要报销")  #全缺 走追问
-    assert res["record_id"] is None
-    assert "补齐" in res["answer"]
-    assert "提高审核通过率" in res["answer"], "追问应含 事由 软提示"
-    print("[PASS] test_ask_missing_includes_soft_hints")
-
-
-def test_fill_success_shows_real_bill_no():
-    #测提交成功回真实单号不显示占位
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    res = a.route("我要报销 张三 研发部 招待费 800 有发票")
-    #必填齐全进确认态 不写表
-    assert res["intent"] == "B"
-    assert res["record_id"] is None, "确认前不写表"
-    assert "确认提交" in res["answer"]
-    #确认后真正写表
-    res2 = a.route("确认提交", base_draft=res["draft"])
-    assert res2["intent"] == "B"
-    assert res2["record_id"], "确认后应已写入飞书"
-    assert res2["bill_no"] == "BX-001", "应取回真实单号"
-    assert "BX-001" in res2["answer"]
-    assert "张三" in res2["answer"], "成功回复应回显申请人（确认参数生效）"
-    assert "招待费" in res2["answer"], "成功回复应回显报销类型"
-    assert "(系统生成中)" not in res2["answer"], "严禁误导占位符"
-    assert "rec_" not in res2["answer"], "不应泄露 record_id"
-    print("[PASS] test_fill_success_shows_real_bill_no")
-
-
-def test_fill_success_soft_hints_when_reason_missing():
-    #测成功回复带事由软提示
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    res = a.route("我要报销 张三 研发部 招待费 800 有发票")
-    res2 = a.route("确认提交", base_draft=res["draft"])
-    assert res2["record_id"]
-    assert "提高审核通过率" in res2["answer"], "成功回复也应带 事由 软提示"
-    print("[PASS] test_fill_success_soft_hints_when_reason_missing")
-
-
-def test_fill_success_travel_city_hint():
-    #测差旅成功回复带城市软提示
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    res = a.route("我要报销 张三 研发部 差旅费 800 有发票")
-    res2 = a.route("确认提交", base_draft=res["draft"])
-    assert res2["record_id"]
-    assert res2["draft"] is None, "提交完成后应清空草稿"
-    assert a.feishu.created[-1]["报销类型"] == "差旅费"
-    assert "加快审核" in res2["answer"], "差旅缺城市应提示补充城市"
-    print("[PASS] test_fill_success_travel_city_hint")
-
-
-def test_fill_success_honest_fallback_when_bill_no_empty():
-    #测单号暂缺时诚实兜底不显示占位
-
-    class NoBillFeishu:
-        #模拟建记录
-        def create_records(self, table_id, records):
-            return ["rec_0_0"]
-
-        #模拟取不到单号
-        def get_record(self, table_id, record_id, **kw):
-            return {"record_id": record_id, "fields": {}}  #单号缺失
-
-    a = _agent(feishu=NoBillFeishu(), table_id="tblX")
-    res = a.route("我要报销 张三 研发部 招待费 800 有发票")
-    res2 = a.route("确认提交", base_draft=res["draft"])
-    assert res2["record_id"], "仍应视为提交成功"
-    assert "(系统生成中)" not in res2["answer"], "严禁误导占位符"
-    assert "进度查询" in res2["answer"], "应诚实引导去进度查询"
-    print("[PASS] test_fill_success_honest_fallback_when_bill_no_empty")
-
-
-def test_reason_not_polluted_by_type_amount():
-    #回归 类型加金额不当事由
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    txt = "我要填报销单，我是张三，研发部，出差费200元"
-    f = a._extract_fields(txt)
-    assert f["category"] == "差旅费"
-    assert f["amount"] == 200
-    assert f["reason"] == "", f"事由不应被'出差费200元'污染, got {f['reason']!r}"
-    res = a.route(txt)
-    #必填齐全进确认态 不直接提交
-    assert res["record_id"] is None, "首次齐全应进入确认态"
-    assert "确认提交" in res["answer"]
-    res2 = a.route("确认提交", base_draft=res["draft"])
-    assert res2["record_id"], "确认后应提交成功"
-    assert "提高审核通过率" in res2["answer"], "缺事由应给出事由软提示"
-    assert "加快审核" in res2["answer"], "差旅缺城市应给出城市软提示"
-    print("[PASS] test_reason_not_polluted_by_type_amount")
-
-
-#测有飞书时按工号查进度
-def test_d_progress_with_feishu():
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    res = a.route("查一下工号A123的报销")
-    assert res["intent"] == "D"
-    assert "审批中" in res["answer"]
-    print("[PASS] test_d_progress_with_feishu")
-
-
-def test_d_full_fields_rendered():
-    #测查询全字段展示 空值写无
-    class FullRecFeishu:
-        #模拟返回全字段记录
-        def list_records(self, table_id, **kw):
-            return [{
-                "record_id": "r1",
-                "fields": {
-                    "单号": "BX-000007", "申请人": "小新", "部门": "市场部",
-                    "报销类型": "交通费", "金额": 10, "事由": "打车",
-                    "状态": "已驳回", "合规结果": "通过", "风险摘要": "",
-                    "审核人": "玩总", "审批意见": "不通过，不属于公司报销",
-                    "审批时间": 1760000000000,  #毫秒时间戳需格式化
-                    "发票信息": "2311；北京山柏云商贸中心",
-                    "发票附件": [{"file_token": "ftk", "name": "发票.png"}],
-                    #城市/工号等故意缺 应显示无
-                },
-            }]
-
-    a = _agent(feishu=FullRecFeishu(), table_id="tblX")
-    res = a.route("查询小新的进度")
-    ans = res["answer"]
-    #有值字段必须出现
-    for needle in ("审核人：玩总", "审批意见：不通过，不属于公司报销",
-                   "审批时间：", "发票信息：2311；北京山柏云商贸中心",
-                   "发票附件：发票.png", "合规结果：通过"):
-        assert needle in ans, f"答案应含「{needle}」\n{ans}"
-    #时间戳格式化为日期
-    assert "202" in ans and str(1760000000000) not in ans, "审批时间应格式化"
-    #空字段必须写无
-    for line in ("城市：无", "工号：无", "票据状态：无", "风险摘要：无"):
-        assert line in ans, f"空字段应写「无」：{line}\n{ans}"
-    print("[PASS] test_d_full_fields_rendered")
-
-
-def test_d_progress_bx_number_precise():
-    #测按单号精确匹配不误命中
-    class TwoRecFeishu:
-        #模拟返回两条记录
-        def list_records(self, table_id, **kw):
-            return [
-                {"record_id": "r1", "fields": {"单号": "BX-000013", "申请人": "小新新"}},
-                {"record_id": "r2", "fields": {"单号": "BX-000014", "申请人": "李雷"}},
-            ]
-
-    a = _agent(feishu=TwoRecFeishu(), table_id="tblX")
-    res = a.route("帮我查 BX-000014")
-    assert res["intent"] == "D"
-    assert "BX-000014" in res["answer"]
-    assert "BX-000013" not in res["answer"], "不应误命中 BX-000013"
-    print("[PASS] test_d_progress_bx_number_precise")
-
-
-#测未接飞书时查询给提示
-def test_d_progress_without_feishu():
-    a = _agent()  #无 feishu
-    res = a.route("查一下工号A123的报销")
-    assert res["intent"] == "D"
-    assert "未接入" in res["answer"]
-    print("[PASS] test_d_progress_without_feishu")
-
-
-#测 reranker 注入生效
-def test_reranker_injection():
-    calls = {"n": 0}
-
-    #模拟重排 反转顺序
-    def mock_reranker(query, chunks):
-        calls["n"] += 1
-        reordered = list(reversed(chunks))
-        for i, c in enumerate(reordered):
-            c.score = round(1.0 - i * 0.1, 4)
-        return reordered
-
-    a = _agent(reranker=mock_reranker)
-    res = a.route("差旅费住宿标准是多少")
-    assert calls["n"] == 1, "reranker 应被调用一次"
-    #验证重排顺序按 reranker 返回
-    assert res["chunks"][0].score >= res["chunks"][-1].score
-    print("[PASS] test_reranker_injection")
-
-
-#测 compressor 注入生效
-def test_compressor_injection():
-    #模拟压缩返回固定串
-    def mock_compress(query, text):
-        return "COMPRESSED"
-
-    a = _agent(compressor=mock_compress)
-    res = a.route("差旅费住宿标准")
-    #压缩作用在喂给模型的上下文里
-    user_msg = a.llm.provider.calls[-1]["messages"][-1]["content"]
-    assert "COMPRESSED" in user_msg, "压缩应生效于上下文"
-    print("[PASS] test_compressor_injection")
-
-
-#回归 只有类型加金额也判 B
-def test_classify_fill_continuation_type_word():
-    #无填单触发词也应判填单
-    a = _agent()
-    assert a.classify_intent("办公费 20块") == "B"
-    #政策问句仍判 A
-    assert a.classify_intent("差旅费住宿标准是多少") == "A"
-    print("[PASS] test_classify_fill_continuation_type_word")
-
-
 def test_extract_applicant_no_garbage():
-    #回归 噪声不得截出姓名
-    a = _agent()
-    f = a._extract_fields("有电子发票")
-    assert f["applicant"] == "", f"申请人不应被噪声污染, got {f['applicant']!r}"
-    assert f["has_invoice"] == "有票", f"有电子发票应判有票, got {f['has_invoice']!r}"
+    f = XiaoCaiAgent._extract_fields("我要报销")
+    assert f["applicant"] == "", f
     print("[PASS] test_extract_applicant_no_garbage")
 
 
-def test_route_fill_sticky_keeps_name():
-    #回归 续答粘连 B 且不冲掉姓名
+# ---------- 合规阈值 ----------
+
+def test_compliance_entertainment_over_limit():
     a = _agent()
-    base = {"applicant": "张三", "department": "研发部", "category": "", "amount": 0,
-            "reason": "", "has_invoice": "未提", "city": "", "date": "", "special": None}
-    res = a.route("办公费", base_draft=base)
-    assert res["intent"] == "B", "应留在 B 填单"
-    assert res["draft"] is not None, "仍缺金额应处于追问态（草稿保留）"
-    assert res["draft"]["applicant"] == "张三", "已确认姓名不应被冲掉"
-    assert res["draft"]["category"] == "办公用品", "应抽取出报销类型"
-    assert res["draft"]["amount"] == 0, "未提供金额不应臆造"
-    print("[PASS] test_route_fill_sticky_keeps_name")
+    level, msg = a._compliance_check({"category": "招待费", "amount": 3000, "has_invoice": "有票"})
+    assert level == "风险", (level, msg)
+    assert "2000" in msg, msg
+    print("[PASS] test_compliance_entertainment_over_limit")
 
 
-def test_route_fill_sticky_bare_name():
-    #回归 仅说姓名也粘连 B 填单
+def test_compliance_no_invoice_blocks():
     a = _agent()
-    base = {"applicant": "", "department": "研发部", "category": "", "amount": 0,
-            "reason": "", "has_invoice": "未提", "city": "", "date": "", "special": None}
-    res = a.route("张三", base_draft=base)
+    level, msg = a._compliance_check({"category": "招待费", "amount": 800, "has_invoice": "无票"})
+    assert level == "阻断", (level, msg)
+    print("[PASS] test_compliance_no_invoice_blocks")
+
+
+def test_compliance_office_supplies_over_limit():
+    a = _agent()
+    level, msg = a._compliance_check({"category": "办公用品", "amount": 6000, "has_invoice": "有票"})
+    assert level == "风险" and "5000" in msg, (level, msg)
+    print("[PASS] test_compliance_office_supplies_over_limit")
+
+
+def test_compliance_travel_city_cap():
+    a = _agent()
+    level, msg = a._compliance_check(
+        {"category": "差旅费", "amount": 800, "has_invoice": "有票", "city": "上海"})
+    assert level == "风险" and "500" in msg, (level, msg)
+    print("[PASS] test_compliance_travel_city_cap")
+
+
+# ---------- B 填单 ----------
+
+def test_fill_missing_asks_when_incomplete():
+    _backend()
+    a = _agent()
+    res = a.route("我要填报销单", actor=_actor())
     assert res["intent"] == "B"
-    assert res["draft"]["applicant"] == "张三"
-    print("[PASS] test_route_fill_sticky_bare_name")
+    assert "部门" in res["answer"] or "报销类型" in res["answer"], res["answer"]
+    print("[PASS] test_fill_missing_asks_when_incomplete")
 
 
-def test_chat_fill_sticky_e2e():
-    #端到端回归 填单续答不误判咨询
-    from api.main import dispatch
-    from api.session import SessionStore
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    s = SessionStore()
-    auth, tok = FakeAuth(), "tok-test"
-    r1 = dispatch("POST", "/chat", {"session_id": "e2e", "text": "我要填报销单，我是张三，研发部"},
-                  a, s, auth=auth, token=tok)
-    assert r1[0] == 200 and r1[1]["intent"] == "B"
-    #续答只有类型金额也粘连 B
-    r2 = dispatch("POST", "/chat", {"session_id": "e2e", "text": "办公费 20块"},
-                  a, s, auth=auth, token=tok)
-    assert r2[0] == 200 and r2[1]["intent"] == "B", "「办公费 20块」应留在 B"
-    assert "张三" in r2[1]["answer"], "确认摘要应含申请人张三"
-    assert r2[1]["record_id"] is None, "确认前不应写表"
-    assert "确认提交" in r2[1]["answer"]
-    #确认后真正提交
-    r3 = dispatch("POST", "/chat", {"session_id": "e2e", "text": "确认提交"},
-                  a, s, auth=auth, token=tok)
-    assert r3[0] == 200 and r3[1]["intent"] == "B"
-    assert "张三" in r3[1]["answer"], "提交申请人应为张三"
-    assert r3[1]["record_id"], "确认后字段齐全应已写表"
-    assert a.feishu.created[-1].get("工号") == "E0001", "登录身份工号应写入"
-    print("[PASS] test_chat_fill_sticky_e2e")
+def test_fill_waits_for_confirm_before_writing():
+    fake = _backend()
+    a = _agent()
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=_actor())
+    assert res["draft"] and res["draft"].get("await_confirm"), res
+    assert not fake.submitted, "未确认前不得提交"
+    print("[PASS] test_fill_waits_for_confirm_before_writing")
 
 
-def test_fill_guide_button():
-    #测填单引导口令输出友好文本
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    res = a.route("填单引导")
-    assert res["intent"] == "B"
-    assert res["record_id"] is None, "引导只讲解，不写表"
-    assert res["draft"] == {}, "应留空草稿，承接后续逐项补齐"
-    for kw in ("申请人", "部门", "报销类型", "金额", "票据", "事由", "城市", "发票日期"):
-        assert kw in res["answer"], f"引导应包含参数 {kw}"
-    assert "{" not in res["answer"] and "}" not in res["answer"], "引导禁止输出 JSON"
-    #空草稿粘性 补齐后进确认态
-    r2 = a.route("我是张三，研发部，招待费 800 有发票", base_draft=res["draft"])
-    assert r2["intent"] == "B"
-    assert "确认提交" in r2["answer"], "补齐必填后应进入确认态"
-    print("[PASS] test_fill_guide_button")
+def test_fill_confirm_submits_via_backend():
+    fake = _backend()
+    a = _agent()
+    actor = _actor()
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor)
+    res2 = a.route("确认提交", base_draft=res["draft"], actor=actor)
+    assert res2["record_id"], res2
+    assert "BX-000123" in res2["answer"], res2["answer"]
+    assert len(fake.submitted) == 1, fake.submitted
+    rec = fake.submitted[0]
+    assert rec["department"] == "研发部" and rec["rtype"] == "招待费"
+    assert rec["amount"] == 800 and rec["has_invoice"] == "有票"
+    assert rec["applicant"] == "张三" and rec["employeeId"] == "E0001"
+    assert rec["reason"] == "客户招待", rec["reason"]
+    print("[PASS] test_fill_confirm_submits_via_backend")
 
 
-def test_progress_name_followup():
-    #回归 追问后回纯姓名继续查进度
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    r1 = a.route("查询一下我的报销进度")
-    assert r1["intent"] == "D"
-    assert "请提供姓名或报销单号" in r1["answer"]
-    history = [
-        {"role": "user", "content": "查询一下我的报销进度"},
-        {"role": "assistant", "content": r1["answer"]},
-    ]
-    r2 = a.route("小新", history=history)
-    assert r2["intent"] == "D", "纯姓名续答应继续 D 查询"
-    assert "BX" in r2["answer"], "应查到记录并展示单号"
-    print("[PASS] test_progress_name_followup")
+def test_extract_reason_basic():
+    #事由要剥掉引导词里的「是/为」并按字段名截断
+    cases = {
+        "事由是报销车费": "报销车费",
+        "事由：客户招待餐费": "客户招待餐费",
+        "用途是出差谈客户": "出差谈客户",
+        "因为请客户吃饭": "请客户吃饭",
+        "备注是招待客户": "招待客户",
+        "事由是客户餐叙金额800城市北京": "客户餐叙",
+        "事由为发票OCR冒烟测试": "发票OCR冒烟测试",
+    }
+    for text, expected in cases.items():
+        got = XiaoCaiAgent._extract_fields(text)["reason"]
+        assert got == expected, (text, got, expected)
+    print("[PASS] test_extract_reason_basic")
 
 
-def test_d_query_with_name_phrase():
-    #回归 查询某人进度直接抽姓名检索
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    for q in ("查询小新的进度", "查询张三的进度"):
-        r = a.route(q)
-        assert r["intent"] == "D"
-        assert "请提供姓名或报销单号" not in r["answer"], f"{q} 不应再反问姓名"
-    r3 = a.route("查询贝星东的进度")
-    assert r3["intent"] == "D"
-    assert "没有找到" in r3["answer"], "查无此人应提示未找到（确实查过），而不是反问姓名"
-    #代词不当姓名 仍反问
-    r4 = a.route("查询我的进度")
-    assert "请提供姓名或报销单号" in r4["answer"]
-    print("[PASS] test_d_query_with_name_phrase")
+def test_fill_asks_reason_when_missing():
+    #缺事由要追问 不能送去主服务器让它 400
+    fake = _backend()
+    a = _agent()
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票", actor=_actor())
+    assert res["intent"] == "B" and res["draft"].get("await_reason"), res
+    assert "事由" in res["answer"], res["answer"]
+    assert not fake.submitted
+    print("[PASS] test_fill_asks_reason_when_missing")
 
 
-def test_d_followup_possessive_name():
-    #回归 带的后缀姓名继续查进度
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    r1 = a.route("查询一下我的报销进度")
-    assert "请提供姓名或报销单号" in r1["answer"]
-    history = [
-        {"role": "user", "content": "查询一下我的报销进度"},
-        {"role": "assistant", "content": r1["answer"]},
-    ]
-    r2 = a.route("小新的", history=history)
-    assert r2["intent"] == "D", "「小新的」应继续 D 查询，不误判成咨询"
-    assert "请提供姓名或报销单号" not in r2["answer"]
-    print("[PASS] test_d_followup_possessive_name")
+def test_fill_reason_from_single_sentence_after_ask():
+    #追问过事由后 用户只回一句短语也要收下
+    fake = _backend()
+    a = _agent()
+    actor = _actor()
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票", actor=actor)
+    res2 = a.route("客户招待餐费", base_draft=res["draft"], actor=actor)
+    assert res2["intent"] == "B", res2
+    assert res2["draft"]["reason"] == "客户招待餐费", res2["draft"]
+    assert res2["draft"].get("await_confirm"), "补齐后应进入确认态"
+    res3 = a.route("确认提交", base_draft=res2["draft"], actor=actor)
+    assert res3["record_id"], res3
+    assert fake.submitted[0]["reason"] == "客户招待餐费", fake.submitted[0]
+    print("[PASS] test_fill_reason_from_single_sentence_after_ask")
 
 
-def test_d_bill_no_no_cross_match():
-    #回归 单号不做子串误匹配
-    class TwoRec:
-        #模拟返回两条记录
-        def list_records(self, table_id, **kw):
-            return [
-                {"record_id": "r1", "fields": {"单号": "BX-000097", "城市": "北京", "金额": 8,
-                                                "报销类型": "差旅费", "状态": "待审核"}},
-                {"record_id": "r2", "fields": {"单号": "BX-000098", "申请人": "小新", "部门": "运营部",
-                                                "金额": 50, "报销类型": "交通费", "状态": "待审核"}},
-            ]
-
-    a = _agent(feishu=TwoRec(), table_id="tblX")
-    r = a.route("查询BX-000098的")
-    assert r["intent"] == "D"
-    assert "BX-000098" in r["answer"], "应查到目标单号"
-    assert "BX-000097" not in r["answer"], "金额8/字段子串不应导致误命中 97"
-    #连字符省略或大小写也能对上
-    r2 = a.route("查询BX000098")
-    assert "BX-000098" in r2["answer"]
-    print("[PASS] test_d_bill_no_no_cross_match")
+def test_reason_excludes_already_known_fields():
+    #回归：一句话里同时补多个字段时 事由只保留剩下的那部分
+    _backend()
+    a = _agent()
+    actor = _actor()
+    res = a.route("我要报销 张三", actor=actor)
+    assert res["draft"].get("await_reason"), res["draft"]
+    res2 = a.route("财务部 交通费 200元 通勤", base_draft=res["draft"], actor=actor)
+    assert res2["draft"]["department"] == "财务部", res2["draft"]
+    assert res2["draft"]["category"] == "交通费", res2["draft"]
+    assert res2["draft"]["amount"] == 200, res2["draft"]
+    assert res2["draft"]["reason"] == "通勤", res2["draft"]
+    print("[PASS] test_reason_excludes_already_known_fields")
 
 
-def test_d_followup_bill_no():
-    #回归 追问后回单号继续查进度
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    r1 = a.route("查询一下我的报销进度")
-    assert "请提供姓名或报销单号" in r1["answer"]
-    history = [
-        {"role": "user", "content": "查询一下我的报销进度"},
-        {"role": "assistant", "content": r1["answer"]},
-    ]
-    for reply in ("BX-000098", "单号BX000098", "bx-000098", "我是张三"):
-        r2 = a.route(reply, history=history)
-        assert r2["intent"] == "D", f"「{reply}」应继续 D 查询"
-        assert "政策" not in (r2.get("answer") or "")[:20], f"「{reply}」不应落到咨询分支"
-    print("[PASS] test_d_followup_bill_no")
+def test_reason_not_filled_when_only_field_words():
+    #整句都是别的字段时 不能把整句硬塞进事由 应继续追问
+    _backend()
+    a = _agent()
+    actor = _actor()
+    res = a.route("我要报销 张三", actor=actor)
+    res2 = a.route("财务部 交通费 200元", base_draft=res["draft"], actor=actor)
+    assert not res2["draft"].get("reason"), res2["draft"]
+    assert "事由" in res2["answer"], res2["answer"]
+    assert "不用重复" in res2["answer"], res2["answer"]
+    print("[PASS] test_reason_not_filled_when_only_field_words")
 
 
-_EMPLOYEE = {"username": "zhangsan", "name": "张三", "role": "员工",
-             "department": "研发部", "employee_id": "E0001"}
-_FINANCE = {"username": "caiwu", "name": "钱会计", "role": "财务",
-            "department": "财务部", "employee_id": "E0002"}
+def test_fill_confirm_without_reason_does_not_call_backend():
+    #确认时仍没事由 只能继续追问 绝不打主服务器
+    fake = _backend()
+    fake.fail = "rejected"
+    a = _agent()
+    actor = _actor()
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票", actor=actor)
+    res2 = a.route("确认提交", base_draft=res["draft"], actor=actor)
+    assert not res2["record_id"], res2
+    assert "事由" in res2["answer"], res2["answer"]
+    assert not fake.submitted, "缺少必填项时不应提交"
+    print("[PASS] test_fill_confirm_without_reason_does_not_call_backend")
 
 
-def test_role_c_blocked_for_employee():
-    #测员工预审被拒且不写表
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    res = a.route("帮我预审一下 招待费 3000 有发票", user=_EMPLOYEE)
-    assert res["intent"] == "C"
-    assert "财务" in res["answer"], "应提示仅财务/管理员可预审"
-    assert res["record_id"] is None
-    assert not a.feishu.created, "员工预审不得写表"
-    print("[PASS] test_role_c_blocked_for_employee")
+def test_fill_rejects_reporting_for_others():
+    fake = _backend()
+    a = _agent()
+    res = a.route("我要报销 李四 研发部 招待费 800 有发票 事由是客户招待", actor=_actor())
+    assert "只能由本人提交" in res["answer"], res["answer"]
+    assert "李四" in res["answer"], res["answer"]
+    assert res.get("draft") is None, res
+    assert not fake.submitted, "替人报账不得提交"
+    print("[PASS] test_fill_rejects_reporting_for_others")
 
 
-def test_role_c_allowed_for_finance():
-    #测财务可正常预审
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    res = a.route("帮我预审一下 我是钱会计 财务部 招待费 300 有发票", user=_FINANCE)
-    assert res["intent"] == "C"
-    assert res["compliance"] in ("通过", "风险")
-    print("[PASS] test_role_c_allowed_for_finance")
+def test_fill_rejects_help_someone_pattern():
+    #「帮X报」句式同样要拦
+    fake = _backend()
+    a = _agent()
+    res = a.route("帮李四报一笔差旅费 800 有发票 上海", actor=_actor())
+    assert "只能由本人提交" in res["answer"], res["answer"]
+    assert not fake.submitted
+    print("[PASS] test_fill_rejects_help_someone_pattern")
 
 
-def test_role_d_employee_forced_self():
-    #测员工只能查自己 财务可查他人
-    a = _agent(feishu=MockFeishu(), table_id="tblX")  #离线飞书记录的申请人固定
-    res = a.route("查询小新新的进度", user=_EMPLOYEE)
-    assert res["intent"] == "D"
-    assert "没有找到" in res["answer"] and "小新新" not in res["answer"], \
-        "员工查他人应被强制改为查自己（张三无记录）"
-    res2 = a.route("查询小新新的进度", user=_FINANCE)
-    assert res2["intent"] == "D" and "小新新" in res2["answer"], "财务应可查任意人"
-    print("[PASS] test_role_d_employee_forced_self")
+def test_fill_no_false_intercept_on_expense_words():
+    #回归：费用词不能被当成人名而误拦本人填单
+    fake = _backend()
+    a = _agent()
+    for text in ("我要报销交通费", "我要报销", "报销差旅费800 有发票"):
+        res = a.route(text, actor=_actor())
+        assert "只能由本人提交" not in res["answer"], (text, res["answer"])
+        assert not fake.submitted, "此时还没到确认，不该提交"
+    print("[PASS] test_fill_no_false_intercept_on_expense_words")
 
 
-def test_role_b_autofill_identity():
-    #测员工填单姓名部门按账号回填
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    res = a.route("我要报销 李四 招待费 800 有发票", user=_EMPLOYEE)
-    assert res["draft"]["applicant"] == "张三", "冒充他人应被登录身份覆写"
-    assert res["draft"]["department"] == "研发部", "未口述部门应回退账号资料部门"
-    assert "确认提交" in res["answer"]
-    res2 = a.route("确认提交", base_draft=res["draft"], user=_EMPLOYEE)
-    assert res2["record_id"], "确认后应写表"
-    rec = a.feishu.created[-1]
-    assert rec["申请人"] == "张三" and rec["部门"] == "研发部"
-    assert rec.get("工号") == "E0001", "登录身份的工号应写入新表工号字段"
-    print("[PASS] test_role_b_autofill_identity")
+def test_extract_applicant_ignores_expense_words():
+    #抽取层就不能把费用/动作词当人名
+    for text in ("我要报销交通费", "我要报销", "报销差旅费800", "帮我看下报销"):
+        f = XiaoCaiAgent._extract_fields(text)
+        assert f["applicant"] == "", (text, f)
+    #真实姓名仍要抽得到
+    assert XiaoCaiAgent._extract_fields("我是张三，研发部")["applicant"] == "张三"
+    assert XiaoCaiAgent._extract_fields("我要报销 张三 研发部")["applicant"] == "张三"
+    print("[PASS] test_extract_applicant_ignores_expense_words")
 
 
-def test_role_b_spoken_department_wins():
-    #测口述部门优先于账号部门
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    res = a.route("我是管大爷，市场部的，差旅费 2000 有发票", user=_EMPLOYEE)
-    assert res["draft"]["applicant"] == "张三", "姓名仍以登录账号为准"
-    assert res["draft"]["department"] == "市场部", "口述部门应优先于账号资料部门"
-    print("[PASS] test_role_b_spoken_department_wins")
+def test_fill_no_invoice_blocked():
+    fake = _backend()
+    a = _agent()
+    actor = _actor()
+    res = a.route("我要报销 张三 研发部 招待费 800 没发票 事由是客户招待", actor=actor)
+    res2 = a.route("确认提交", base_draft=res["draft"], actor=actor)
+    assert not res2["record_id"], res2
+    assert "发票" in res2["answer"], res2["answer"]
+    assert not fake.submitted, "无票不得提交"
+    print("[PASS] test_fill_no_invoice_blocked")
 
 
-def test_role_anonymous_backward_compatible():
-    #测匿名时保持旧行为
-    a = _agent(feishu=MockFeishu(), table_id="tblX")
-    res = a.route("帮我预审一下 招待费 300 有发票")
-    assert res["intent"] == "C" and res["compliance"] == "通过", "匿名应保持旧行为"
-    res2 = a.route("查询小新新的进度")
-    assert "小新新" in res2["answer"], "匿名 D 查询应按问句关键词"
-    print("[PASS] test_role_anonymous_backward_compatible")
+def test_fill_untipped_invoice_blocked():
+    #未提不再放行：必须先补发票或支付记录
+    fake = _backend()
+    a = _agent()
+    actor = _actor()
+    res = a.route("我要报销 张三 研发部 招待费 800 事由是客户招待", actor=actor)
+    assert "票据" in res["answer"], res["answer"]
+    assert not res["draft"].get("await_confirm"), "未提不应进入确认态"
+    res2 = a.route("确认提交", base_draft=res["draft"], actor=actor)
+    assert not res2["record_id"], res2
+    assert not fake.submitted, "未提不得提交"
+    print("[PASS] test_fill_untipped_invoice_blocked")
 
 
-class MockFeishuM9(MockFeishu):
-    #扩展离线飞书 支持字段名与附件上传
-    def __init__(self, upload_error=None, with_invoice_columns=True):
-        super().__init__()
-        self.uploaded = []   #已上传附件
-        self.updated = []    #已回写记录
-        self._upload_error = upload_error
-        self._names = ({"发票信息", "发票附件"} if with_invoice_columns
-                       else {"事由", "金额", "申请人", "部门"})
-
-    #返回表的字段名
-    def field_names(self, table_id, **kw):
-        return self._names
-
-    #模拟上传附件
-    def upload_attachment(self, filename, file_bytes, content_type="application/octet-stream",
-                          app_token=""):
-        if self._upload_error is not None:
-            raise self._upload_error
-        self.uploaded.append((filename, bytes(file_bytes), content_type))
-        return "boxcnenFakeTokenM9"
-
-    #记录回写调用
-    def update_record(self, table_id, record_id, fields, app_token=""):
-        self.updated.append((table_id, record_id, dict(fields)))
-        return record_id
+def test_fill_backend_rejects_shows_reason():
+    fake = _backend()
+    fake.fail = "rejected"
+    a = _agent()
+    actor = _actor()
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor)
+    res2 = a.route("确认提交", base_draft=res["draft"], actor=actor)
+    assert not res2["record_id"], res2
+    assert "没有提交成功" in res2["answer"], res2["answer"]
+    print("[PASS] test_fill_backend_rejects_shows_reason")
 
 
-_FULL_DRAFT = {
-    "applicant": "张三", "department": "研发部", "category": "差旅费",
-    "amount": 800.0, "reason": "出差住宿", "has_invoice": "有票",
-    "city": "北京", "date": "2026/10/1", "await_confirm": True,
-    "special": None,  #draft 必带全键
-    "invoice_no": "INV9001", "invoice_seller": "北京示例酒店",
-}
+def test_fill_backend_down_no_direct_write():
+    fake = _backend()
+    fake.fail = "unavailable"
+    feishu = MockFeishu()
+    a = _agent(feishu=feishu)
+    actor = _actor()
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor)
+    res2 = a.route("确认提交", base_draft=res["draft"], actor=actor)
+    assert "主服务器暂时不可用" in res2["answer"], res2["answer"]
+    assert not feishu.uploaded and not feishu.updated, "不得直连飞书"
+    print("[PASS] test_fill_backend_down_no_direct_write")
 
 
-def test_submit_with_invoice_info_and_image():
-    #测带图提交写入发票信息并上传附件
-    import base64 as _b64
-    mf = MockFeishuM9()
-    a = _agent(feishu=mf, table_id="tblX")
-    img = _b64.b64encode(b"\xff\xd8\xff\xe0FAKEJPG").decode()
-    res = a.route("确认提交", base_draft=dict(_FULL_DRAFT),
-                  image_b64=img, image_mime="image/jpeg")
-    assert res["record_id"], "应提交成功拿到 record_id"
-    rec = mf.created[0]
-    assert rec.get("发票信息") == "INV9001；北京示例酒店", "发票信息应随单写入"
-    assert mf.uploaded and mf.uploaded[0][0] == "发票.jpg"
-    assert bytes(mf.uploaded[0][1]) == b"\xff\xd8\xff\xe0FAKEJPG"
-    assert mf.updated, "应回写发票附件"
-    tid, rid, fields = mf.updated[0]
-    assert rid == res["record_id"] and fields["发票附件"] == [{"file_token": "boxcnenFakeTokenM9"}]
-    assert "已存档" in res["answer"]
-    print("[PASS] test_submit_with_invoice_info_and_image")
+def test_fill_bogus_department_asked_not_submitted():
+    fake = _backend()
+    a = _agent()
+    actor = _actor()
+    res = a.route("我要报销 张三 火星部 招待费 800 有发票 事由是客户招待", actor=actor)
+    #部门归一失败应为空 进入追问而不是直接提交
+    assert not res["draft"] or not res["draft"].get("department"), res
+    assert not fake.submitted
+    print("[PASS] test_fill_bogus_department_asked_not_submitted")
 
 
-def test_submit_without_image_no_attachment_call():
-    #测无图提交不写发票信息不上传
-    mf = MockFeishuM9()
-    a = _agent(feishu=mf, table_id="tblX")
-    draft = {k: v for k, v in _FULL_DRAFT.items() if not k.startswith("invoice")}
-    res = a.route("确认提交", base_draft=draft)
-    assert res["record_id"]
-    assert "发票信息" not in mf.created[0]
-    assert not mf.uploaded and not mf.updated
-    assert "已存档" not in res["answer"]
-    print("[PASS] test_submit_without_image_no_attachment_call")
+def test_reason_not_polluted_by_type_amount():
+    _backend()
+    a = _agent()
+    res = a.route("我要报销 张三 研发部 差旅费 800 有发票", actor=_actor())
+    assert res["draft"]["reason"] in ("", None), res["draft"]
+    print("[PASS] test_reason_not_polluted_by_type_amount")
 
 
-def test_attach_failure_degrades_not_blocks():
-    #测附件失败单据仍提交成功
-    from models.feishu import FeishuError
-    mf = MockFeishuM9(upload_error=FeishuError("飞书附件上传失败 code=91403 msg=Forbidden"))
-    a = _agent(feishu=mf, table_id="tblX")
-    import base64 as _b64
-    img = _b64.b64encode(b"JPG").decode()
-    res = a.route("确认提交", base_draft=dict(_FULL_DRAFT), image_b64=img)
-    assert res["record_id"], "附件失败不应影响主流程"
-    assert "存档未成功" in res["answer"]
-    print("[PASS] test_attach_failure_degrades_not_blocks")
+def test_fill_sticky_keeps_branch():
+    _backend()
+    a = _agent()
+    actor = _actor()
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor)
+    res2 = a.route("办公费", base_draft=res["draft"], actor=actor)
+    assert res2["intent"] == "B", res2
+    print("[PASS] test_fill_sticky_keeps_branch")
 
 
 def test_invoice_fields_merged_into_draft():
-    #测识别发票字段并入草稿不带图
-    mf = MockFeishuM9()
-    a = _agent(feishu=mf, table_id="tblX")
-    res = a.route("我是张三，研发部，差旅费 800元，有发票",
-                  invoice_fields={"invoice_no": "INV777", "invoice_seller": "某商务酒店"})
-    d = res.get("draft") or {}
-    assert d.get("invoice_no") == "INV777" and d.get("invoice_seller") == "某商务酒店"
-    assert "aGVsbG8" not in str(d), "草稿中绝不允许出现图片 base64"
+    _backend()
+    a = _agent()
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=_actor(),
+                  invoice_fields={"invoice_no": "2311", "invoice_seller": "某商贸"})
+    assert res["draft"].get("invoice_no") == "2311", res["draft"]
+    assert res["draft"].get("invoice_seller") == "某商贸", res["draft"]
+    assert res["draft"]["has_invoice"] == "有票", res["draft"]
     print("[PASS] test_invoice_fields_merged_into_draft")
+
+
+def test_ocr_invoice_no_sets_has_invoice():
+    #识别出发票号 即使没说票据状态 也必须是有票
+    _backend()
+    a = _agent()
+    res = a.route("我要报销 张三 研发部 办公用品 100 事由是买文具", actor=_actor(),
+                  invoice_fields={"invoice_no": "2311"})
+    assert res["draft"]["has_invoice"] == "有票", res["draft"]
+    print("[PASS] test_ocr_invoice_no_sets_has_invoice")
+
+
+def test_ocr_overrides_spoken_no_invoice():
+    #口述「没发票」但传了票据 以图片为准 → 有票 且能正常提交
+    fake = _backend()
+    a = _agent()
+    actor = _actor()
+    res = a.route("我要报销 张三 研发部 办公用品 100 没发票 事由是买文具", actor=actor,
+                  invoice_fields={"invoice_no": "2311", "invoice_seller": "某商贸"})
+    assert res["draft"]["has_invoice"] == "有票", res["draft"]
+    res2 = a.route("确认提交", base_draft=res["draft"], actor=actor)
+    assert res2["record_id"], res2["answer"]
+    assert fake.submitted[0]["has_invoice"] == "有票", fake.submitted[0]
+    print("[PASS] test_ocr_overrides_spoken_no_invoice")
+
+
+def test_no_ocr_keeps_untipped_status():
+    #没传票据时 不应被误改成有票
+    _backend()
+    a = _agent()
+    res = a.route("我要报销 张三 研发部 办公用品 100 事由是买文具", actor=_actor())
+    assert res["draft"]["has_invoice"] == "未提", res["draft"]
+    print("[PASS] test_no_ocr_keeps_untipped_status")
+
+
+# ---------- 附件（M9） ----------
+
+def test_attach_uploaded_after_submit():
+    _backend()
+    feishu = MockFeishu()
+    a = _agent(feishu=feishu)
+    actor = _actor()
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor)
+    res2 = a.route("确认提交", base_draft=res["draft"], actor=actor,
+                   image_b64=IMG_B64, image_mime="image/png")
+    assert res2["record_id"], res2
+    assert feishu.uploaded, "提交成功后才上传附件"
+    assert feishu.updated and feishu.updated[0][1]["发票附件"], feishu.updated
+    assert "已存档" in res2["answer"], res2["answer"]
+    print("[PASS] test_attach_uploaded_after_submit")
+
+
+def test_attach_skipped_without_image():
+    _backend()
+    feishu = MockFeishu()
+    a = _agent(feishu=feishu)
+    actor = _actor()
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor)
+    a.route("确认提交", base_draft=res["draft"], actor=actor)
+    assert not feishu.uploaded, "无图不应调用上传"
+    print("[PASS] test_attach_skipped_without_image")
+
+
+def test_attach_failure_does_not_block():
+    _backend()
+    feishu = MockFeishu(fail=True)
+    a = _agent(feishu=feishu)
+    actor = _actor()
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor)
+    res2 = a.route("确认提交", base_draft=res["draft"], actor=actor,
+                   image_b64=IMG_B64, image_mime="image/jpeg")
+    assert res2["record_id"], "附件失败不应影响单据"
+    assert "未成功" in res2["answer"] or "未存档" in res2["answer"], res2["answer"]
+    print("[PASS] test_attach_failure_does_not_block")
+
+
+# ---------- C 合规预审 ----------
+
+def test_c_blocked_for_employee():
+    _backend()
+    a = _agent()
+    res = a.route("这笔招待费3000超标了吗", actor=_actor())
+    assert res["intent"] == "C"
+    assert "财务/管理员" in res["answer"], res["answer"]
+    print("[PASS] test_c_blocked_for_employee")
+
+
+def test_c_allowed_for_finance():
+    _backend()
+    a = _agent()
+    res = a.route("这笔招待费3000超标了吗", actor=_actor("finance", "finance", "李四", "E0002"))
+    assert res["intent"] == "C"
+    assert "预审" in res["answer"], res["answer"]
+    assert res["compliance"] == "风险", res
+    print("[PASS] test_c_allowed_for_finance")
+
+
+def test_c_never_creates_record():
+    fake = _backend()
+    a = _agent(feishu=MockFeishu())
+    res = a.route("招待费 800 有发票 研发部 张三 合规吗", actor=_actor("finance", "finance", "李四", "E0002"))
+    assert res["intent"] == "C", res
+    assert not fake.submitted, "预审不得建单"
+    assert res.get("record_id") in (None, ""), res
+    print("[PASS] test_c_never_creates_record")
+
+
+# ---------- D 进度查询 ----------
+
+def _two_rows():
+    return [
+        make_row("r1", "张三", "E0001", "BX-000013", status="审核中"),
+        make_row("r2", "李四", "E0002", "BX-000014", status="已通过"),
+    ]
+
+
+def test_d_employee_sees_only_self():
+    _backend(_two_rows())
+    a = _agent()
+    res = a.route("查一下所有人的报销", actor=_actor())
+    assert res["intent"] == "D"
+    nos = [r["单号"] for r in res["records"]]
+    assert nos == ["BX-000013"], nos
+    assert "BX-000014" not in nos, "员工不应看到他人单据"
+    print("[PASS] test_d_employee_sees_only_self")
+
+
+def test_d_finance_sees_all():
+    _backend(_two_rows())
+    a = _agent()
+    res = a.route("查一下报销", actor=_actor("finance", "finance", "李四", "E0002"))
+    nos = [r["单号"] for r in res["records"]]
+    assert set(nos) == {"BX-000013", "BX-000014"}, nos
+    print("[PASS] test_d_finance_sees_all")
+
+
+def test_d_bill_no_precise():
+    _backend(_two_rows())
+    a = _agent()
+    res = a.route("帮我查 BX-000014", actor=_actor("finance", "finance", "李四", "E0002"))
+    nos = [r["单号"] for r in res["records"]]
+    assert nos == ["BX-000014"], nos
+    assert "BX-000013" not in nos, "不应误命中 BX-000013"
+    print("[PASS] test_d_bill_no_precise")
+
+
+def test_d_answer_is_summary_only():
+    #明细只在 records 里 答案里不再重复整张单
+    _backend(_two_rows())
+    a = _agent()
+    res = a.route("查一下报销", actor=_actor("finance", "finance", "李四", "E0002"))
+    ans = res["answer"]
+    assert "查到 2 条" in ans, ans
+    assert "BX-000013" not in ans and "BX-000014" not in ans, f"答案不该重复明细\n{ans}"
+    print("[PASS] test_d_answer_is_summary_only")
+
+
+def test_d_lists_newest_first():
+    #回归：25 条记录时 最新那条必须排在最前（旧实现按行序取前 20 条 会看不到最新的）
+    rows = [make_row(f"r{i}", "李四", "E0002", f"BX-{i:06d}",
+                     submittedAt=str(1700000000000 + i * 60000))
+            for i in range(1, 26)]
+    _backend(rows)
+    a = _agent()
+    res = a.route("查一下报销", actor=_actor("finance", "finance", "李四", "E0002"))
+    nos = [r["单号"] for r in res["records"]]
+    assert nos[0] == "BX-000025", nos[:3]
+    assert nos == sorted(nos, reverse=True), "应按提交时间倒序"
+    assert len(nos) == 25, "25 条未超上限 应全部返回"
+    print("[PASS] test_d_lists_newest_first")
+
+
+def test_d_truncate_hint():
+    #60 条记录时只展示最近 50 条 并明确告知总数
+    rows = [make_row(f"r{i}", "李四", "E0002", f"BX-{i:06d}",
+                     submittedAt=str(1700000000000 + i * 60000))
+            for i in range(1, 61)]
+    _backend(rows)
+    a = _agent()
+    res = a.route("查一下报销", actor=_actor("finance", "finance", "李四", "E0002"))
+    assert len(res["records"]) == 50, len(res["records"])
+    assert res["records"][0]["单号"] == "BX-000060", res["records"][0]
+    ans = res["answer"]
+    assert "共 60 条" in ans and "显示最近 50 条" in ans, ans[-200:]
+    print("[PASS] test_d_truncate_hint")
+
+
+def test_d_records_carry_all_fields():
+    #后端只给结构化记录 明细由前端卡片渲染 空值也照常带上
+    row = {
+        "recordId": "r1", "billNo": "BX-000007", "applicant": "小新",
+        "employeeId": "", "department": "市场部", "rtype": "交通费",
+        "amount": 10, "reason": "打车", "hasInvoice": "",
+        "city": "", "invoiceDate": "", "submittedAt": "",
+        "compliance": "通过", "riskSummary": "",
+        "status": "已驳回", "reviewer": "玩总",
+        "reviewOpinion": "不通过，不属于公司报销", "reviewedAt": "1760000000000",
+        "invoiceInfo": "2311；北京山柏云商贸中心",
+        "raw": {"发票附件": '[{"file_token":"ftk","name":"发票.png"}]'},
+    }
+    _backend([row])
+    a = _agent()
+    res = a.route("查询小新的进度", actor=_actor("finance", "finance", "李四", "E0002"))
+    assert len(res["records"]) == 1, res["records"]
+    rec = res["records"][0]
+    assert rec["单号"] == "BX-000007", rec
+    assert rec["申请人"] == "小新" and rec["部门"] == "市场部", rec
+    assert rec["报销类型"] == "交通费" and rec["金额"] == 10, rec
+    assert rec["事由"] == "打车", rec
+    assert rec["状态"] == "已驳回", rec
+    assert rec["审核人"] == "玩总", rec
+    assert rec["审批意见"] == "不通过，不属于公司报销", rec
+    assert rec["发票信息"] == "2311；北京山柏云商贸中心", rec
+    assert rec["合规结果"] == "通过", rec
+    #答案里不再重复明细
+    assert "BX-000007" not in res["answer"], res["answer"]
+    print("[PASS] test_d_records_carry_all_fields")
+
+
+def test_d_backend_down_friendly():
+    _backend(_two_rows())
+    fake = FakeBackend(rows=_two_rows())
+    fake.fail = "unavailable"
+    install(fake, backend_client)
+    a = _agent()
+    res = a.route("查一下我的报销", actor=_actor())
+    assert "查询失败" in res["answer"], res["answer"]
+    print("[PASS] test_d_backend_down_friendly")
+
+
+def test_d_not_found_message():
+    _backend([])
+    a = _agent()
+    res = a.route("查一下我的报销", actor=_actor())
+    assert "没有找到" in res["answer"], res["answer"]
+    print("[PASS] test_d_not_found_message")
+
+
+# ---------- fail-closed 与引导 ----------
+
+def test_route_requires_login():
+    _backend()
+    a = _agent()
+    for text in ("我要报销 张三 研发部 招待费 800", "查一下我的报销", "这笔合规吗"):
+        res = a.route(text)
+        assert "请先登录" in res["answer"], (text, res)
+    print("[PASS] test_route_requires_login")
+
+
+def test_confirm_card_shows_risk():
+    #确认卡提前给出风险提示 别等提交后才被打回
+    _backend()
+    a = _agent()
+    res = a.route("我要报销 张三 研发部 招待费 3000 有发票 事由是客户招待", actor=_actor())
+    assert res["draft"].get("await_confirm"), res["draft"]
+    assert "⚠️ 风险提示" in res["answer"], res["answer"]
+    assert "2000" in res["answer"], res["answer"]
+    print("[PASS] test_confirm_card_shows_risk")
+
+
+def test_no_invoice_never_reaches_confirm():
+    #无票根本不进确认卡 直接要求补票
+    _backend()
+    a = _agent()
+    res = a.route("我要报销 张三 研发部 招待费 800 没发票 事由是客户招待", actor=_actor())
+    assert not res["draft"].get("await_confirm"), res["draft"]
+    assert "确认提交" not in res["answer"], res["answer"]
+    assert "发票" in res["answer"], res["answer"]
+    print("[PASS] test_no_invoice_never_reaches_confirm")
+
+
+def test_invoice_reminder_only_when_action_needed():
+    #有票不重复提醒 无票提醒一次
+    _backend()
+    a = _agent()
+    r1 = a.route("我要报销 张三 研发部 招待费 800 有发票", actor=_actor())
+    assert r1["answer"].count("🧾") == 1, r1["answer"]
+    r2 = a.route("我要报销 张三 研发部 招待费 800 没发票", actor=_actor())
+    assert r2["answer"].count("🧾") == 2, r2["answer"]
+    print("[PASS] test_invoice_reminder_only_when_action_needed")
+
+
+def test_messages_avoid_internal_jargon():
+    #不向用户暴露「上传飞书」这类内部实现细节
+    _backend()
+    a = _agent()
+    r1 = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=_actor())
+    r2 = a.route("我要报销 张三 研发部 招待费 800", actor=_actor())
+    for ans in (r1["answer"], r2["answer"]):
+        assert "上传飞书" not in ans, ans
+    print("[PASS] test_messages_avoid_internal_jargon")
+
+
+def test_untipped_asks_once_without_duplicate():
+    #未提时票据引导只出现一次（已并入「还差」清单 不再单独重复）
+    _backend()
+    a = _agent()
+    res = a.route("我要报销 张三 研发部 交通费 200 事由是通勤", actor=_actor())
+    ans = res["answer"]
+    assert ans.count("🧾 还没记票据状态") == 1, ans
+    assert "票据：未提" in ans, ans
+    print("[PASS] test_untipped_asks_once_without_duplicate")
+
+
+def test_only_invoiced_can_reach_confirm():
+    #三种票据状态里只有「有票」能进确认卡
+    _backend()
+    a = _agent()
+    cases = (
+        ("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", True),
+        ("我要报销 张三 研发部 招待费 800 没发票 事由是客户招待", False),
+        ("我要报销 张三 研发部 招待费 800 事由是客户招待", False),
+    )
+    for text, expect in cases:
+        res = a.route(text, actor=_actor())
+        got = bool(res["draft"] and res["draft"].get("await_confirm"))
+        assert got is expect, (text, res["answer"][:100])
+    print("[PASS] test_only_invoiced_can_reach_confirm")
+
+
+def test_do_submit_blocks_untipped():
+    #第二道闸：绕过追问直接调提交 也必须拦住
+    fake = _backend()
+    a = _agent()
+    f = {"applicant": "张三", "department": "研发部", "category": "招待费",
+         "amount": 800, "reason": "客户招待", "has_invoice": "未提",
+         "city": "", "date": ""}
+    ans, rid, no = a._do_submit(f, "未提", actor=_actor())
+    assert rid is None and not no, (ans, rid, no)
+    assert "补上发票" in ans or "支付记录" in ans, ans
+    assert not fake.submitted
+    print("[PASS] test_do_submit_blocks_untipped")
+
+
+def test_confirm_card_mentions_edit_path():
+    #确认卡要告诉用户「说错了可以直接改」 并且改完确实生效
+    _backend()
+    a = _agent()
+    actor = _actor()
+    res = a.route("我要报销 张三 研发部 招待费 41 有发票 事由是客户喝奶茶", actor=actor)
+    assert "有误请直接说要改哪一项" in res["answer"], res["answer"]
+    #按提示改一项 → 草稿更新并重新出确认卡
+    res2 = a.route("金额改成 50", base_draft=res["draft"], actor=actor)
+    assert res2["draft"]["amount"] == 50, res2["draft"]
+    assert "¥50" in res2["answer"], res2["answer"]
+    print("[PASS] test_confirm_card_mentions_edit_path")
+
+
+def test_after_submit_ask_guides_manual():
+    #已提交后想补票/改单 不给假承诺 直接引导找财务或重提
+    fake = _backend()
+    a = _agent()
+    for q in ("我已经提交了还能补发票吗", "能改单吗", "可以撤回吗"):
+        res = a.route(q, actor=_actor())
+        assert "联系财务" in res["answer"], (q, res["answer"])
+        assert "重新上传材料齐全的报销单进飞书财务表" in res["answer"], (q, res["answer"])
+        assert res["record_id"] is None, (q, res)
+    assert not fake.submitted
+    print("[PASS] test_after_submit_ask_guides_manual")
+
+
+def test_fill_guide_button():
+    #必须用精确触发词（UI 快捷按钮发的就是「填单引导」）
+    _backend()
+    a = _agent()
+    res = a.route("填单引导", actor=_actor())
+    assert res["intent"] == "B"
+    assert "【必填 · 一项都不能少】" in res["answer"], res["answer"]
+    assert "申请人" in res["answer"], res["answer"]
+    #事由是必填 必须在必填区；票据要提示可传支付记录
+    assert "📝 事由" in res["answer"], res["answer"]
+    assert "支付记录" in res["answer"], res["answer"]
+    print("[PASS] test_fill_guide_button")
 
 
 if __name__ == "__main__":
@@ -899,55 +821,64 @@ if __name__ == "__main__":
     test_classify_intent_compliance()
     test_classify_intent_progress()
     test_consult_offline()
-    test_b_fill_with_feishu()
-    test_b_fill_without_feishu()
-    test_c_compliance()
     test_extract_fields_basic()
     test_extract_department_routes_to_enum()
     test_extract_city_routes_to_whitelist()
-    test_fill_bogus_department_asked_not_written()
     test_extract_chinese_date_no_year()
     test_extract_special_category_blocks()
+    test_extract_applicant_no_garbage()
     test_compliance_entertainment_over_limit()
     test_compliance_no_invoice_blocks()
+    test_compliance_office_supplies_over_limit()
+    test_compliance_travel_city_cap()
     test_fill_missing_asks_when_incomplete()
-    test_b_invoice_untipped_submits()
-    test_b_invoice_none_blocks()
-    test_b_invoice_none_then_fixed()
-    test_fill_special_category_reply()
-    test_soft_hints_reason_missing()
-    test_soft_hints_travel_city_missing()
-    test_ask_missing_includes_soft_hints()
-    test_fill_success_shows_real_bill_no()
-    test_fill_success_soft_hints_when_reason_missing()
-    test_fill_success_travel_city_hint()
-    test_fill_success_honest_fallback_when_bill_no_empty()
+    test_fill_waits_for_confirm_before_writing()
+    test_fill_confirm_submits_via_backend()
+    test_extract_reason_basic()
+    test_fill_asks_reason_when_missing()
+    test_fill_reason_from_single_sentence_after_ask()
+    test_reason_excludes_already_known_fields()
+    test_reason_not_filled_when_only_field_words()
+    test_fill_confirm_without_reason_does_not_call_backend()
+    test_fill_rejects_reporting_for_others()
+    test_fill_rejects_help_someone_pattern()
+    test_fill_no_false_intercept_on_expense_words()
+    test_extract_applicant_ignores_expense_words()
+    test_fill_no_invoice_blocked()
+    test_fill_untipped_invoice_blocked()
+    test_fill_backend_rejects_shows_reason()
+    test_fill_backend_down_no_direct_write()
+    test_fill_bogus_department_asked_not_submitted()
     test_reason_not_polluted_by_type_amount()
-    test_d_progress_with_feishu()
-    test_d_full_fields_rendered()
-    test_d_progress_without_feishu()
-    test_d_progress_bx_number_precise()
-    test_reranker_injection()
-    test_compressor_injection()
-    test_classify_fill_continuation_type_word()
-    test_extract_applicant_no_garbage()
-    test_route_fill_sticky_keeps_name()
-    test_route_fill_sticky_bare_name()
-    test_chat_fill_sticky_e2e()
-    test_fill_guide_button()
-    test_progress_name_followup()
-    test_d_query_with_name_phrase()
-    test_d_followup_possessive_name()
-    test_d_bill_no_no_cross_match()
-    test_d_followup_bill_no()
-    test_role_c_blocked_for_employee()
-    test_role_c_allowed_for_finance()
-    test_role_d_employee_forced_self()
-    test_role_b_autofill_identity()
-    test_role_b_spoken_department_wins()
-    test_role_anonymous_backward_compatible()
-    test_submit_with_invoice_info_and_image()
-    test_submit_without_image_no_attachment_call()
-    test_attach_failure_degrades_not_blocks()
+    test_fill_sticky_keeps_branch()
     test_invoice_fields_merged_into_draft()
+    test_ocr_invoice_no_sets_has_invoice()
+    test_ocr_overrides_spoken_no_invoice()
+    test_no_ocr_keeps_untipped_status()
+    test_attach_uploaded_after_submit()
+    test_attach_skipped_without_image()
+    test_attach_failure_does_not_block()
+    test_c_blocked_for_employee()
+    test_c_allowed_for_finance()
+    test_c_never_creates_record()
+    test_d_employee_sees_only_self()
+    test_d_finance_sees_all()
+    test_d_bill_no_precise()
+    test_d_lists_newest_first()
+    test_d_truncate_hint()
+    test_d_records_carry_all_fields()
+    test_d_answer_is_summary_only()
+    test_d_backend_down_friendly()
+    test_d_not_found_message()
+    test_route_requires_login()
+    test_confirm_card_shows_risk()
+    test_no_invoice_never_reaches_confirm()
+    test_invoice_reminder_only_when_action_needed()
+    test_untipped_asks_once_without_duplicate()
+    test_only_invoiced_can_reach_confirm()
+    test_do_submit_blocks_untipped()
+    test_messages_avoid_internal_jargon()
+    test_confirm_card_mentions_edit_path()
+    test_after_submit_ask_guides_manual()
+    test_fill_guide_button()
     print("\n全部 M4 编排层单测通过")

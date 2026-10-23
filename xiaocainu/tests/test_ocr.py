@@ -155,13 +155,14 @@ def test_engine_empty_content_raises_with_detail():
 
 
 def test_engine_not_invoice_raises():
-    #非发票图片报错
+    #非发票图片报错 提示要告诉用户下一步传什么
     eng, _ = _engine('{"error": "not_invoice"}')
     try:
         eng.extract(image_b64="aGVsbG8=")
         assert False, "应抛 OCRError"
     except OCRError as e:
-        assert "不是发票" in str(e)
+        assert "没识别出报销要素" in str(e)
+        assert "支付凭证" in str(e)
 
 
 def test_engine_illegal_base64_raises():

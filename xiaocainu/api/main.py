@@ -18,11 +18,10 @@ from models import (
     Retriever,
 )
 from models.config import knowledge_dir, get_ocr_config
-from models.feishu import build_reimbursement_record
+from models.actor import Actor, PERM_INVOICE_SUBMIT
 from models.ocr import (
     InvoiceOCREngine, MockOcrEngine, OCRError, build_invoice_preview,
 )
-from models.users import ROLE_EMPLOYEE
 from .session import SessionStore
 from .auth_service import AuthService, build_auth
 from . import backend_client
@@ -59,8 +58,7 @@ class LoginRequest(BaseModel):
 
 
 class ReimburseRequest(BaseModel):
-    #填单请求体
-    applicant: str = Field(default="", max_length=32)
+    #填单请求体 申请人/工号/合规结果/状态由主服务器按登录身份盖章 这里不再接收
     department: str = Field(default="", max_length=32)
     rtype: str = Field(default="", max_length=16)
     amount: float = Field(default=0, ge=0, le=10_000_000)
@@ -68,9 +66,6 @@ class ReimburseRequest(BaseModel):
     has_invoice: str = Field(default="", max_length=8)
     city: str = Field(default="", max_length=16)
     date_str: str = Field(default="", max_length=24)
-    compliance: str = Field(default="通过", max_length=16)
-    risk_summary: str = Field(default="", max_length=200)
-    status: str = Field(default="待审核", max_length=16)
 
 
 class ProgressRequest(BaseModel):
@@ -89,12 +84,13 @@ def build_agent() -> XiaoCaiAgent:
     retriever = Retriever.from_directory(knowledge_dir())
     feishu = None
     table_id = ""
-    if os.getenv("FEISHU_APP_ID"):
+    #飞书只用于发票附件列写入 单据读写一律经主服务器
+    if os.getenv("FEISHU_APP_ID") and os.getenv("FEISHU_TABLE_ID"):
         feishu = FeishuBitableClient.from_env()
         table_id = os.getenv("FEISHU_TABLE_ID", "")
-        print(f"[M5] 飞书已接入：table_id={table_id or '(未设置)'}")
+        print(f"[M5] 飞书已接入（仅附件列）：table_id={table_id}")
     else:
-        print("[M5] 未检测到 FEISHU_APP_ID，B/C/D 走降级（不真发）。")
+        print("[M5] 未配置飞书主表，发票附件将不上传（单据读写仍走主服务器）。")
     return XiaoCaiAgent(llm, retriever, feishu=feishu, table_id=table_id)
 
 
@@ -190,7 +186,6 @@ def index():
 
 #免认证端点白名单
 _PUBLIC_ENDPOINTS = {("GET", "/health"), ("POST", "/login")}
-_AUTH_USER_KEYS = ("username", "name", "role", "employee_id")
 
 
 def _bearer(token: str) -> str:
@@ -209,18 +204,22 @@ def dispatch(method: str, path: str, body: Dict[str, Any], agent: XiaoCaiAgent,
     if method == "GET" and path == "/health":
         return 200, {"status": "ok"}
 
-    #认证墙 白名单外都要登录
-    auth_ctx = None
+    #认证墙 白名单外都要登录 身份只认主服务器令牌
+    actor = None
     if (method, path) not in _PUBLIC_ENDPOINTS:
         if auth is None:
-            return 401, {"error": "auth required (server auth not configured)"}
-        auth_ctx = auth.verify(_bearer(token))
-        if auth_ctx is None:
+            return 503, {"error": "网关未启用登录：未配置 BACKEND_BASE_URL（主服务器地址）"}
+        try:
+            actor = auth.authenticate(_bearer(token))
+        except backend_client.BackendError as e:
+            #主服务器故障不伪装成未登录 否则用户会一直重登
+            return 503, {"error": f"主服务器暂时不可用，无法校验登录状态：{e}"}
+        if actor is None:
             return 401, {"error": "未登录或登录已过期，请重新登录"}
 
     if method == "POST" and path == "/login":
         if auth is None:
-            return 503, {"error": "auth not configured (set FEISHU_USER_TABLE_ID in .env)"}
+            return 503, {"error": "网关未启用登录：未配置 BACKEND_BASE_URL（主服务器地址）"}
         username = sanitize_text(body.get("username") or "", max_length=32)
         password = body.get("password") or ""  #口令不净化 只限长度
         if not username or not password or len(password) > 64:
@@ -228,16 +227,17 @@ def dispatch(method: str, path: str, body: Dict[str, Any], agent: XiaoCaiAgent,
         return auth.login(username, password, client_ip=client_ip)
 
     if method == "GET" and path == "/me":
-        return 200, {"user": {k: auth_ctx.get(k, "") for k in _AUTH_USER_KEYS}}
+        return 200, {"user": actor.public(), "perms": sorted(actor.permissions)}
 
     if method == "POST" and path == "/logout":
+        #主服务器不做令牌吊销 这里只清本网关的身份缓存
         auth.logout(_bearer(token))
         return 200, {"ok": True}
 
     if method == "POST" and path == "/chat":
         sid = (body.get("session_id") or "default")[:64]
         #会话绑定用户 换用户即拒绝
-        ok, err = auth.bind_sid(sid, auth_ctx.get("username", ""))
+        ok, err = auth.bind_sid(sid, actor.user_id or actor.username)
         if not ok:
             return 403, {"error": err}
         #净化文本 截断超长
@@ -267,9 +267,8 @@ def dispatch(method: str, path: str, body: Dict[str, Any], agent: XiaoCaiAgent,
         #业务处理
         history = store.get_messages(sid)
         base_draft = store.get_draft(sid)
-        #登录身份传给 agent
-        user_ctx = {k: auth_ctx.get(k, "") for k in _AUTH_USER_KEYS} if auth_ctx else None
-        res = agent.route(text, history=history, base_draft=base_draft, user=user_ctx,
+        #登录身份传给 agent 权限判断以主服务器下发的权限键为准
+        res = agent.route(text, history=history, base_draft=base_draft, actor=actor,
                           image_b64=image_b64, image_mime=image_mime,
                           invoice_fields=invoice_fields)
         answer = res.get("answer", "")
@@ -285,7 +284,7 @@ def dispatch(method: str, path: str, body: Dict[str, Any], agent: XiaoCaiAgent,
         if engine is None:
             return 503, {"error": "OCR not configured (set DEEPSEEK_API_KEY in .env)"}
         sid = (body.get("session_id") or "default")[:64]
-        ok, err = auth.bind_sid(sid, auth_ctx.get("username", ""))
+        ok, err = auth.bind_sid(sid, actor.user_id or actor.username)
         if not ok:
             return 403, {"error": err}
         if not OCR_LIMITER.allow(f"ocr:{sid}"):
@@ -301,7 +300,7 @@ def dispatch(method: str, path: str, body: Dict[str, Any], agent: XiaoCaiAgent,
                 content_type=mime, filename=filename,
             )
         except OCRError as e:
-            return 502, {"error": f"OCR failed: {e}"}
+            return 502, {"error": f"识别失败：{e}"}
         fields = dict(result.fields)
         return 200, {
             "ok": True,
@@ -317,75 +316,46 @@ def dispatch(method: str, path: str, body: Dict[str, Any], agent: XiaoCaiAgent,
         }
 
     if method == "POST" and path == "/reimburse":
-        #单据统一走主服务器写入
-        username = auth_ctx.get("username", "")
-        applicant = auth_ctx.get("name") or username or body.get("applicant", "")
-        department = body.get("department") or auth_ctx.get("department") or ""
-        if backend_client.enabled():
-            try:
-                data = backend_client.submit_as(
-                    username,
-                    department=department,
-                    rtype=body.get("rtype", ""),
-                    amount=body.get("amount", 0),
-                    reason=body.get("reason", ""),
-                    has_invoice=body.get("has_invoice", ""),
-                    city=body.get("city", ""),
-                    date_str=body.get("date_str", ""),
-                )
-                return 200, {
-                    "record_id": data.get("record_id") or "",
-                    "bill_no": data.get("bill_no") or "",
-                    "status": "待审核",
-                    "via": "main-server",
-                    "message": data.get("message") or "",
-                }
-            except backend_client.BackendError as e:
-                if backend_client.mode() == "required":
-                    return 503, {"error": f"主服务器不可用，单据未提交：{e}"}
-                print(f"[backend] /reimburse 未走主服务器，回落直连飞书：{e}")
-
-        if not agent.feishu:
-            return 503, {"error": "feishu not connected (set FEISHU_APP_ID in .env)"}
-        f = body
-        #申请人工号以登录身份为准
+        #单据只经主服务器写入 这是唯一写入口
+        if not actor.can(PERM_INVOICE_SUBMIT):
+            return 403, {"error": "当前账号没有提交报销单的权限"}
         try:
-            rec = build_reimbursement_record(
-                applicant=applicant,
-                department=department,
-                rtype=f.get("rtype", ""),
-                amount=f.get("amount", 0),
-                reason=f.get("reason", ""),
-                has_invoice=f.get("has_invoice", ""),
-                city=f.get("city", ""),
-                date_str=f.get("date_str", ""),
-                compliance=f.get("compliance", "通过"),
-                risk_summary=f.get("risk_summary", ""),
-                status=f.get("status", "待审核"),
-                employee_id=auth_ctx.get("employee_id", ""),
+            data = backend_client.submit_with_token(
+                actor.token, actor.sign_key,
+                department=body.get("department", ""),
+                rtype=body.get("rtype", ""),
+                amount=body.get("amount", 0),
+                reason=body.get("reason", ""),
+                has_invoice=body.get("has_invoice", ""),
+                city=body.get("city", ""),
+                date_str=body.get("date_str", ""),
             )
-            rec = agent._fit_schema(rec)  #旧表无工号列时自动剔除
-            ids = agent.feishu.create_records(agent.table_id, [rec])
-            rid = ids[0] if ids else None
-            bill_no = agent._fetch_bill_no(rid) if rid else ""
-            return 200, {"record_id": rid, "bill_no": bill_no, "status": "待审核"}
-        except Exception as e:  #返回飞书错误信息
-            return 500, {"error": str(e)}
+        except backend_client.BackendUnauthorized as e:
+            return 401, {"error": f"登录已过期，请重新登录：{e}"}
+        except backend_client.BackendRejected as e:
+            #业务拒绝不回落 原样回给用户
+            return (429 if e.status == 429 else 400), {"error": str(e)}
+        except backend_client.BackendError as e:
+            return 503, {"error": f"主服务器暂时不可用，单据未提交：{e}"}
+        return 200, {
+            "record_id": data.get("record_id") or "",
+            "bill_no": data.get("bill_no") or "",
+            "status": "待审核",
+            "via": "main-server",
+            "message": data.get("message") or "",
+        }
 
     if method == "POST" and path == "/progress":
         applicant = (body.get("applicant") or "").strip()
         bill_no = (body.get("bill_no") or "").strip()
-        #员工只能查自己的进度
-        if auth_ctx.get("role") == ROLE_EMPLOYEE:
-            applicant = (auth_ctx.get("name") or auth_ctx.get("username") or "").strip()
-            bill_no = ""
         if bill_no:
             q = f"查 {bill_no}"
         elif applicant:
             q = f"查一下{applicant}的报销"
         else:
             return 400, {"error": "applicant or bill_no required"}
-        res = agent.route(q)
+        #查询范围由主服务器按令牌角色裁剪 这里不再按角色重写查询条件
+        res = agent.route(q, actor=actor)
         return 200, res
 
     return 404, {"error": "not found", "path": path}

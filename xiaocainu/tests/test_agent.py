@@ -117,7 +117,8 @@ def test_extract_fields_basic():
     assert f["department"] == "研发部", f
     assert f["category"] == "招待费", f
     assert f["amount"] == 800, f
-    assert f["has_invoice"] == "有票", f
+    #口述「有发票」不再计为已开票：必须由 OCR 证据才能置「有票」
+    assert f["has_invoice"] == "未提", f
     print("[PASS] test_extract_fields_basic")
 
 
@@ -199,7 +200,7 @@ def test_fill_missing_asks_when_incomplete():
 def test_fill_waits_for_confirm_before_writing():
     fake = _backend()
     a = _agent()
-    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=_actor())
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=_actor(), invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
     assert res["draft"] and res["draft"].get("await_confirm"), res
     assert not fake.submitted, "未确认前不得提交"
     print("[PASS] test_fill_waits_for_confirm_before_writing")
@@ -209,7 +210,7 @@ def test_fill_confirm_submits_via_backend():
     fake = _backend()
     a = _agent()
     actor = _actor()
-    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor)
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor, invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
     res2 = a.route("确认提交", base_draft=res["draft"], actor=actor)
     assert res2["record_id"], res2
     assert "BX-000123" in res2["answer"], res2["answer"]
@@ -243,7 +244,7 @@ def test_fill_asks_reason_when_missing():
     #缺事由要追问 不能送去主服务器让它 400
     fake = _backend()
     a = _agent()
-    res = a.route("我要报销 张三 研发部 招待费 800 有发票", actor=_actor())
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票", actor=_actor(), invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
     assert res["intent"] == "B" and res["draft"].get("await_reason"), res
     assert "事由" in res["answer"], res["answer"]
     assert not fake.submitted
@@ -255,7 +256,7 @@ def test_fill_reason_from_single_sentence_after_ask():
     fake = _backend()
     a = _agent()
     actor = _actor()
-    res = a.route("我要报销 张三 研发部 招待费 800 有发票", actor=actor)
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票", actor=actor, invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
     res2 = a.route("客户招待餐费", base_draft=res["draft"], actor=actor)
     assert res2["intent"] == "B", res2
     assert res2["draft"]["reason"] == "客户招待餐费", res2["draft"]
@@ -300,7 +301,7 @@ def test_fill_confirm_without_reason_does_not_call_backend():
     fake.fail = "rejected"
     a = _agent()
     actor = _actor()
-    res = a.route("我要报销 张三 研发部 招待费 800 有发票", actor=actor)
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票", actor=actor, invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
     res2 = a.route("确认提交", base_draft=res["draft"], actor=actor)
     assert not res2["record_id"], res2
     assert "事由" in res2["answer"], res2["answer"]
@@ -311,7 +312,7 @@ def test_fill_confirm_without_reason_does_not_call_backend():
 def test_fill_rejects_reporting_for_others():
     fake = _backend()
     a = _agent()
-    res = a.route("我要报销 李四 研发部 招待费 800 有发票 事由是客户招待", actor=_actor())
+    res = a.route("我要报销 李四 研发部 招待费 800 有发票 事由是客户招待", actor=_actor(), invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
     assert "只能由本人提交" in res["answer"], res["answer"]
     assert "李四" in res["answer"], res["answer"]
     assert res.get("draft") is None, res
@@ -323,7 +324,7 @@ def test_fill_rejects_help_someone_pattern():
     #「帮X报」句式同样要拦
     fake = _backend()
     a = _agent()
-    res = a.route("帮李四报一笔差旅费 800 有发票 上海", actor=_actor())
+    res = a.route("帮李四报一笔差旅费 800 有发票 上海", actor=_actor(), invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
     assert "只能由本人提交" in res["answer"], res["answer"]
     assert not fake.submitted
     print("[PASS] test_fill_rejects_help_someone_pattern")
@@ -382,7 +383,7 @@ def test_fill_backend_rejects_shows_reason():
     fake.fail = "rejected"
     a = _agent()
     actor = _actor()
-    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor)
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor, invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
     res2 = a.route("确认提交", base_draft=res["draft"], actor=actor)
     assert not res2["record_id"], res2
     assert "没有提交成功" in res2["answer"], res2["answer"]
@@ -395,7 +396,7 @@ def test_fill_backend_down_no_direct_write():
     feishu = MockFeishu()
     a = _agent(feishu=feishu)
     actor = _actor()
-    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor)
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor, invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
     res2 = a.route("确认提交", base_draft=res["draft"], actor=actor)
     assert "主服务器暂时不可用" in res2["answer"], res2["answer"]
     assert not feishu.uploaded and not feishu.updated, "不得直连飞书"
@@ -406,7 +407,7 @@ def test_fill_bogus_department_asked_not_submitted():
     fake = _backend()
     a = _agent()
     actor = _actor()
-    res = a.route("我要报销 张三 火星部 招待费 800 有发票 事由是客户招待", actor=actor)
+    res = a.route("我要报销 张三 火星部 招待费 800 有发票 事由是客户招待", actor=actor, invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
     #部门归一失败应为空 进入追问而不是直接提交
     assert not res["draft"] or not res["draft"].get("department"), res
     assert not fake.submitted
@@ -416,7 +417,7 @@ def test_fill_bogus_department_asked_not_submitted():
 def test_reason_not_polluted_by_type_amount():
     _backend()
     a = _agent()
-    res = a.route("我要报销 张三 研发部 差旅费 800 有发票", actor=_actor())
+    res = a.route("我要报销 张三 研发部 差旅费 800 有发票", actor=_actor(), invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
     assert res["draft"]["reason"] in ("", None), res["draft"]
     print("[PASS] test_reason_not_polluted_by_type_amount")
 
@@ -425,7 +426,7 @@ def test_fill_sticky_keeps_branch():
     _backend()
     a = _agent()
     actor = _actor()
-    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor)
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor, invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
     res2 = a.route("办公费", base_draft=res["draft"], actor=actor)
     assert res2["intent"] == "B", res2
     print("[PASS] test_fill_sticky_keeps_branch")
@@ -482,7 +483,7 @@ def test_attach_uploaded_after_submit():
     feishu = MockFeishu()
     a = _agent(feishu=feishu)
     actor = _actor()
-    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor)
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor, invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
     res2 = a.route("确认提交", base_draft=res["draft"], actor=actor,
                    image_b64=IMG_B64, image_mime="image/png")
     assert res2["record_id"], res2
@@ -497,7 +498,7 @@ def test_attach_skipped_without_image():
     feishu = MockFeishu()
     a = _agent(feishu=feishu)
     actor = _actor()
-    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor)
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor, invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
     a.route("确认提交", base_draft=res["draft"], actor=actor)
     assert not feishu.uploaded, "无图不应调用上传"
     print("[PASS] test_attach_skipped_without_image")
@@ -508,7 +509,7 @@ def test_attach_failure_does_not_block():
     feishu = MockFeishu(fail=True)
     a = _agent(feishu=feishu)
     actor = _actor()
-    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor)
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=actor, invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
     res2 = a.route("确认提交", base_draft=res["draft"], actor=actor,
                    image_b64=IMG_B64, image_mime="image/jpeg")
     assert res2["record_id"], "附件失败不应影响单据"
@@ -693,7 +694,7 @@ def test_confirm_card_shows_risk():
     #确认卡提前给出风险提示 别等提交后才被打回
     _backend()
     a = _agent()
-    res = a.route("我要报销 张三 研发部 招待费 3000 有发票 事由是客户招待", actor=_actor())
+    res = a.route("我要报销 张三 研发部 招待费 3000 有发票 事由是客户招待", actor=_actor(), invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
     assert res["draft"].get("await_confirm"), res["draft"]
     assert "⚠️ 风险提示" in res["answer"], res["answer"]
     assert "2000" in res["answer"], res["answer"]
@@ -715,7 +716,7 @@ def test_invoice_reminder_only_when_action_needed():
     #有票不重复提醒 无票提醒一次
     _backend()
     a = _agent()
-    r1 = a.route("我要报销 张三 研发部 招待费 800 有发票", actor=_actor())
+    r1 = a.route("我要报销 张三 研发部 招待费 800 有发票", actor=_actor(), invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
     assert r1["answer"].count("🧾") == 1, r1["answer"]
     r2 = a.route("我要报销 张三 研发部 招待费 800 没发票", actor=_actor())
     assert r2["answer"].count("🧾") == 2, r2["answer"]
@@ -726,7 +727,7 @@ def test_messages_avoid_internal_jargon():
     #不向用户暴露「上传飞书」这类内部实现细节
     _backend()
     a = _agent()
-    r1 = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=_actor())
+    r1 = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=_actor(), invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
     r2 = a.route("我要报销 张三 研发部 招待费 800", actor=_actor())
     for ans in (r1["answer"], r2["answer"]):
         assert "上传飞书" not in ans, ans
@@ -754,7 +755,9 @@ def test_only_invoiced_can_reach_confirm():
         ("我要报销 张三 研发部 招待费 800 事由是客户招待", False),
     )
     for text, expect in cases:
-        res = a.route(text, actor=_actor())
+        #口述「有发票」不算数，必须有 OCR 证据才能进确认卡
+        inv = {"invoice_no": "2311", "invoice_seller": "某商贸"} if "有发票" in text else None
+        res = a.route(text, actor=_actor(), invoice_fields=inv)
         got = bool(res["draft"] and res["draft"].get("await_confirm"))
         assert got is expect, (text, res["answer"][:100])
     print("[PASS] test_only_invoiced_can_reach_confirm")
@@ -779,8 +782,8 @@ def test_confirm_card_mentions_edit_path():
     _backend()
     a = _agent()
     actor = _actor()
-    res = a.route("我要报销 张三 研发部 招待费 41 有发票 事由是客户喝奶茶", actor=actor)
-    assert "有误请直接说要改哪一项" in res["answer"], res["answer"]
+    res = a.route("我要报销 张三 研发部 招待费 41 有发票 事由是客户喝奶茶", actor=actor, invoice_fields={"invoice_no":"2311","invoice_seller":"某商贸"})
+    assert "有误请直接说明哪一项修改为什么" in res["answer"], res["answer"]
     #按提示改一项 → 草稿更新并重新出确认卡
     res2 = a.route("金额改成 50", base_draft=res["draft"], actor=actor)
     assert res2["draft"]["amount"] == 50, res2["draft"]
@@ -813,6 +816,387 @@ def test_fill_guide_button():
     assert "📝 事由" in res["answer"], res["answer"]
     assert "支付记录" in res["answer"], res["answer"]
     print("[PASS] test_fill_guide_button")
+
+
+# ---------- 问题3：口述「有发票」不再计为已开票 ----------
+
+def test_spoken_invoice_claim_does_not_count():
+    #只口述「有发票」但无任何 OCR 证据 → 仍是未提，且不能进确认卡
+    _backend()
+    a = _agent()
+    res = a.route("我要报销 张三 研发部 招待费 800 有发票 事由是客户招待", actor=_actor())
+    assert res["draft"]["has_invoice"] == "未提", res["draft"]
+    assert not (res["draft"] and res["draft"].get("await_confirm")), "无证据不应到确认态"
+    assert "发票" in res["answer"], res["answer"]
+    print("[PASS] test_spoken_invoice_claim_does_not_count")
+
+
+# ---------- 问题1：只传发票（无前置文字）按发票信息补齐 ----------
+
+def test_only_upload_fills_from_ocr_and_asks_missing():
+    _backend()
+    a = _agent()
+    res = a.route("📎 发票已上传，请帮我填单", actor=_actor(),
+                  invoice_fields={"invoice_no": "2311", "invoice_seller": "某商贸",
+                                  "amount": 50.98, "category": "办公用品",
+                                  "date": "2024/4/7", "source": "invoice"})
+    d = res["draft"]
+    assert d["has_invoice"] == "有票", d
+    assert d["amount"] == 50.98, d          #精度不丢
+    assert d["category"] == "办公用品", d
+    assert d["invoice_no"] == "2311", d
+    #缺部门/事由 → 继续追问，而不是误判齐了
+    assert "部门" in res["answer"] or "事由" in res["answer"], res["answer"]
+    print("[PASS] test_only_upload_fills_from_ocr_and_asks_missing")
+
+
+# ---------- 问题2：先文字后发票，以票为准 + 事由保留 ----------
+
+def test_text_then_upload_conflict_uses_invoice():
+    _backend()
+    a = _agent()
+    #先文字：800 差旅费 事由「出差住酒店」
+    r1 = a.route("我要报销 张三 研发部 差旅费 800 事由是出差住酒店", actor=_actor())
+    #再传发票：50.98 办公用品（金额/类型以票为准，事由保留）
+    r2 = a.route("📎 发票已上传，请帮我填单", base_draft=r1["draft"], actor=_actor(),
+                 invoice_fields={"invoice_no": "2311", "invoice_seller": "某商贸",
+                                 "amount": 50.98, "category": "办公用品",
+                                 "date": "2024/4/7", "source": "invoice"})
+    d = r2["draft"]
+    assert d["amount"] == 50.98, d
+    assert d["category"] == "办公用品", d
+    assert d["reason"] == "出差住酒店", d            #事由保留用户原值
+    ans = r2["answer"]
+    assert "不一致" in ans, ans                      #金额冲突提示
+    assert "已按发票改为" in ans, ans                #类型冲突提示
+    assert "事由是否仍适用" in ans, ans              #事由保留提示
+    print("[PASS] test_text_then_upload_conflict_uses_invoice")
+
+
+# ---------- 支付凭证（voucher）也算有票 ----------
+
+def test_voucher_counts_as_invoiced():
+    fake = _backend()
+    a = _agent()
+    #只传支付凭证（无发票号）→ 仍算有票
+    res = a.route("📎 支付凭证已上传，请帮我填单", actor=_actor(),
+                  invoice_fields={"amount": 88.5, "date": "2024/4/7",
+                                  "category": "交通费", "source": "voucher"})
+    d = res["draft"]
+    assert d["has_invoice"] == "有票", d             #凭证也算有票
+    assert d.get("invoice_source") == "voucher", d
+    #补齐部门/事由后再确认提交
+    res2 = a.route("我是张三 研发部 事由是打车", base_draft=d, actor=_actor())
+    assert res2["draft"] and res2["draft"].get("await_confirm"), res2["answer"]
+    actor = _actor()
+    res3 = a.route("确认提交", base_draft=res2["draft"], actor=actor)
+    assert res3["record_id"], res3["answer"]
+    #提交后发票信息带「支付凭证：」前缀
+    assert fake.submitted[0]["invoice_info"].startswith("支付凭证"), fake.submitted[0]
+    print("[PASS] test_voucher_counts_as_invoiced")
+
+
+# ---------- 票据状态迁移规则（用户 2026-10-25 拍板） ----------
+
+def test_existing_ticket_not_downgraded_by_spoken_no_invoice():
+    #有票 + 用户明说「没发票」→ 维持有票（必须有票才能提交，无票无意义）
+    fake = _backend()
+    a = _agent()
+    actor = _actor()
+    #第一轮：上传发票 → 有票
+    r1 = a.route("我要报销 张三 研发部 办公用品 100 事由是买文具", actor=actor,
+                 invoice_fields={"invoice_no": "2311", "invoice_seller": "某商贸",
+                                 "amount": 100, "category": "办公用品", "source": "invoice"})
+    assert r1["draft"]["has_invoice"] == "有票", r1["draft"]
+    #第二轮：用户改口说「没发票」→ 票据状态不回退
+    r2 = a.route("没发票", base_draft=r1["draft"], actor=actor)
+    assert r2["draft"]["has_invoice"] == "有票", r2["draft"]
+    #且要明确告诉用户按票据计算，不静默吞掉这句话
+    assert "按「有票」计算" in r2["answer"], r2["answer"]
+    #仍可正常提交
+    r3 = a.route("确认提交", base_draft=r2["draft"], actor=actor)
+    assert r3["record_id"], r3["answer"]
+    assert fake.submitted[0]["has_invoice"] == "有票", fake.submitted[0]
+    print("[PASS] test_existing_ticket_not_downgraded_by_spoken_no_invoice")
+
+
+def test_no_invoice_then_upload_evidence_becomes_invoiced():
+    #无票 + 下一轮上传证据 → 有票（实物纠正口误），跨轮生效
+    _backend()
+    a = _agent()
+    actor = _actor()
+    r1 = a.route("我要报销 张三 研发部 办公用品 100 没发票 事由是买文具", actor=actor)
+    assert r1["draft"]["has_invoice"] == "无票", r1["draft"]
+    r2 = a.route("📎 发票已上传，请帮我填单", base_draft=r1["draft"], actor=actor,
+                 invoice_fields={"invoice_no": "2311", "invoice_seller": "某商贸",
+                                 "amount": 100, "category": "办公用品", "source": "invoice"})
+    assert r2["draft"]["has_invoice"] == "有票", r2["draft"]
+    print("[PASS] test_no_invoice_then_upload_evidence_becomes_invoiced")
+
+
+# ---------- 填单中吐槽「金额没显示」不该被踢去政策咨询 ----------
+
+def test_complaint_about_amount_stays_in_fill_branch():
+    #「财务部 招待费 金额不是有显示吗 喝奶茶」含问号 但是在填单 → 必须走 B
+    _backend()
+    a = _agent()
+    actor = _actor()
+    r1 = a.route("📎 发票已上传，请帮我填单", actor=actor,
+                 invoice_fields={"invoice_no": "2311", "invoice_seller": "某商贸",
+                                 "amount": 14.42, "category": "招待费",
+                                 "date": "2026/10/23", "source": "invoice"})
+    assert r1["draft"]["amount"] == 14.42, r1["draft"]
+    r2 = a.route("财务部 招待费 金额不是有显示吗 喝奶茶",
+                 base_draft=r1["draft"], actor=actor)
+    assert r2["intent"] == "B", f"不该走咨询分支: {r2}"
+    #吐槽句不能被当成事由
+    assert "有显示吗" not in (r2["draft"].get("reason") or ""), r2["draft"]
+    #已识别的金额要如实回显 不能说「读不到」
+    assert "14.42" in r2["answer"], r2["answer"]
+    assert "不会自动读取" not in r2["answer"], r2["answer"]
+    print("[PASS] test_complaint_about_amount_stays_in_fill_branch")
+
+
+def test_policy_question_in_fill_still_goes_consult():
+    #填单中问真制度问题（标准/上限）→ 仍放行 A 咨询 不能被拉进填单
+    _backend()
+    a = _agent()
+    actor = _actor()
+    r1 = a.route("我要报销 张三 研发部 差旅费 800 事由是出差", actor=actor)
+    r2 = a.route("差旅费住宿标准是多少", base_draft=r1["draft"], actor=actor)
+    assert r2["intent"] == "A", f"制度问句应走咨询: {r2}"
+    print("[PASS] test_policy_question_in_fill_still_goes_consult")
+
+
+# ---------- 用户文字改字段（票据状态不可改 其他字段可改） ----------
+
+def test_text_edit_overrides_ocr_fields_except_invoice_status():
+    #复现用户截图：上传凭证后 连说「是交通费」「不是财务部是市场部」都被弹回旧值
+    _backend()
+    a = _agent()
+    actor = _actor()
+    #第1轮：上传支付凭证（OCR 识别 14.42 / 办公用品）
+    r1 = a.route("📎 支付凭证已上传，请帮我填单", actor=actor,
+                 invoice_fields={"invoice_no": "", "invoice_seller": "某商贸",
+                                 "amount": 14.42, "category": "办公用品",
+                                 "date": "2026/10/23", "source": "voucher",
+                                 "upload_id": "u1"})
+    assert r1["draft"]["amount"] == 14.42, r1["draft"]
+    assert r1["draft"]["category"] == "办公用品", r1["draft"]
+    #第2轮：用户说「是交通费」——前端仍捎带同一份 OCR 字段
+    r2 = a.route("是交通费", base_draft=r1["draft"], actor=actor,
+                 invoice_fields={"invoice_no": "", "invoice_seller": "某商贸",
+                                 "amount": 14.42, "category": "办公用品",
+                                 "date": "2026/10/23", "source": "voucher",
+                                 "upload_id": "u1"})
+    assert r2["draft"]["category"] == "交通费", f"类型没改过来: {r2['draft']}"
+    #金额没被用户提到 → 保持票据值 14.42
+    assert r2["draft"]["amount"] == 14.42, r2["draft"]
+    #票据状态不受影响
+    assert r2["draft"]["has_invoice"] == "有票", r2["draft"]
+    print("[PASS] test_text_edit_overrides_ocr_fields_except_invoice_status")
+
+
+def test_negation_correction_picks_new_value():
+    #「不是办公用品是招待费」→ 招待费；「不是财务部是市场部」→ 市场部
+    a = _agent()
+    assert a._extract_fields("不是办公用品是招待费")["category"] == "招待费"
+    assert a._extract_fields("不是财务部是市场部")["department"] == "市场部"
+    assert a._extract_fields("改成交通费")["category"] == "交通费"
+    assert a._extract_fields("金额不是14.42是200")["amount"] == 200.0
+    print("[PASS] test_negation_correction_picks_new_value")
+
+
+def test_plain_affirmative_department_edit():
+    #复现用户截图：旧草稿部门=市场部，用户说「部门是财务部」应改成财务部
+    #（之前正则把"是"吞进部门名 → normalize 失败 → 部门纹丝不动；金额却能改）
+    a = _agent()
+    #单元层：平铺肯定句「部门是/叫/为 X」都能归一
+    assert a._extract_fields("部门是财务部")["department"] == "财务部", \
+        a._extract_fields("部门是财务部")
+    assert a._extract_fields("部门叫市场部")["department"] == "市场部"
+    assert a._extract_fields("部门为研发部")["department"] == "研发部"
+    #端到端：在已有草稿上改部门，其它字段保持、票据状态依旧锁定
+    #（直接走 _handle_fill：这正是 bug 所在层；真实场景因 await_confirm 粘性也会落到这里）
+    _backend()
+    actor = _actor()
+    base = {"applicant": "张三", "department": "市场部", "category": "交通费",
+            "amount": 20.0, "reason": "送顾客", "has_invoice": "有票",
+            "city": "", "date": "2026/10/23", "await_confirm": True}
+    r = a._handle_fill("部门是财务部", base_draft=base, actor=actor)
+    assert r["draft"]["department"] == "财务部", f"部门没改过来: {r['draft']}"
+    assert r["draft"]["amount"] == 20.0, r["draft"]
+    assert r["draft"]["category"] == "交通费", r["draft"]
+    assert r["draft"]["has_invoice"] == "有票", r["draft"]
+    print("[PASS] test_plain_affirmative_department_edit")
+
+
+def test_field_directed_edits_template():
+    #A方案：模板句「aa字段修改为xxx」每个字段都改得准 事由不再把「修改为」吞进值里
+    a = _agent()
+    cases = [
+        ("部门修改为财务部", "department", "财务部"),
+        ("报销类型修改为招待费", "category", "招待费"),
+        ("城市修改为上海", "city", "上海"),
+        ("日期修改为2026/10/1", "date", "2026/10/1"),
+        ("事由修改为请客户吃饭", "reason", "请客户吃饭"),
+    ]
+    base = {"department": "市场部", "category": "办公用品", "amount": 100.0,
+            "city": "北京", "date": "2026/9/9", "reason": "旧事由"}
+    for text, key, expect in cases:
+        f = a._merge_draft(dict(base), a._extract_fields(text))
+        notes = []
+        edited = a._apply_field_edits(f, text, notes, base_draft=dict(base))
+        assert f[key] == expect, f"{text} → {f[key]!r} want {expect!r}; notes={notes}"
+        assert key in edited, f"{text} 未命中定向编辑回执; notes={notes}"
+        assert any("已把" in n for n in notes), notes
+    #金额锁定（2026-10-30）：草稿带 amount_locked 时定向改金额被拒并明示
+    locked = dict(base, amount_locked=True)
+    f = a._merge_draft(dict(locked), a._extract_fields("金额修改为200"))
+    n = []
+    edited = a._apply_field_edits(f, "金额修改为200", n, base_draft=dict(locked))
+    assert f["amount"] == 100.0, (f, n)
+    assert "amount" not in edited, (edited, n)
+    assert any("以发票识别为准" in x for x in n), n
+    print("[PASS] test_field_directed_edits_template")
+
+
+def test_field_edit_casual_phrasings():
+    #A方案：不带「字段名+修改为」模板的口语说法也能改
+    a = _agent()
+    base = {"department": "市场部", "amount": 100.0}
+    #口语前缀「帮我把…」
+    f = a._merge_draft(dict(base), a._extract_fields("帮我把部门改成财务部"))
+    n = []
+    a._apply_field_edits(f, "帮我把部门改成财务部", n, base_draft=dict(base))
+    assert f["department"] == "财务部", (f, n)
+    #尾部语气词「了」不混进值
+    f = a._merge_draft(dict(base), a._extract_fields("部门改成财务部了"))
+    n = []
+    a._apply_field_edits(f, "部门改成财务部了", n, base_draft=dict(base))
+    assert f["department"] == "财务部", (f, n)
+    #一句话改两个字段
+    f = a._merge_draft(dict(base), a._extract_fields("部门改成财务部 金额改成200"))
+    n = []
+    a._apply_field_edits(f, "部门改成财务部 金额改成200", n, base_draft=dict(base))
+    assert f["department"] == "财务部" and f["amount"] == 200.0, (f, n)
+    #疑问句不当修改指令（解析器零产出；泛用抽取捞到类型词是既有行为 与定向编辑无关）
+    assert a._parse_field_edits("报销类型是交通费吗") == [], a._parse_field_edits("报销类型是交通费吗")
+    assert a._parse_field_edits("事由是什么意思") == [], a._parse_field_edits("事由是什么意思")
+    print("[PASS] test_field_edit_casual_phrasings")
+
+
+def test_field_edit_end_to_end_via_fill():
+    #A方案端到端：确认卡场景一句话改部门+金额 有回执 锁死字段不动
+    #金额已锁定（有发票识别值）→ 金额改不动并明示 其他字段照常改
+    _backend()
+    a = _agent()
+    actor = _actor()
+    base = {"applicant": "张三", "department": "市场部", "category": "办公用品",
+            "amount": 100.0, "reason": "书本书费", "has_invoice": "有票",
+            "city": "北京", "date": "2026/10/1", "await_confirm": True,
+            "amount_locked": True}
+    r = a._handle_fill("部门修改为财务部，金额修改为200", base_draft=dict(base), actor=actor)
+    assert r["draft"]["department"] == "财务部", r["draft"]
+    assert r["draft"]["amount"] == 100.0, r["draft"]
+    assert r["draft"]["city"] == "北京" and r["draft"]["has_invoice"] == "有票", r["draft"]
+    assert "已把部门改为 「财务部」" in r["answer"], r["answer"]
+    assert "以发票识别为准" in r["answer"], r["answer"]
+    print("[PASS] test_field_edit_end_to_end_via_fill")
+
+
+def test_field_edit_protected_fields():
+    #A方案：申请人/票据状态两个锁死字段 明确拒改并提示
+    a = _agent()
+    f = {"applicant": "张三", "has_invoice": "有票"}
+    n = []
+    a._apply_field_edits(f, "申请人改成李四 票据改成无票", n, base_draft=dict(f))
+    assert f["applicant"] == "张三" and f["has_invoice"] == "有票", (f, n)
+    assert any("登录身份" in x for x in n), n
+    assert any("票据状态" in x for x in n), n
+    print("[PASS] test_field_edit_protected_fields")
+
+
+def test_field_edit_fresh_upload_invoice_wins():
+    #A方案 × 以票为准：本轮刚上传新票据时 定向改金额不吃文字值
+    _backend()
+    a = _agent()
+    actor = _actor()
+    r1 = a.route("📎 发票已上传，请帮我填单", actor=actor,
+                 invoice_fields={"invoice_no": "123", "invoice_seller": "某公司",
+                                 "amount": 14.42, "source": "invoice", "upload_id": "u9"})
+    assert r1["draft"]["amount"] == 14.42, r1["draft"]
+    #换新票据（upload_id 变）+ 同句要改金额 → 金额锁定为发票值并明示
+    r2 = a.route("金额修改为200", base_draft=r1["draft"], actor=actor,
+                 invoice_fields={"invoice_no": "123", "invoice_seller": "某公司",
+                                 "amount": 14.42, "source": "invoice", "upload_id": "u10"})
+    assert r2["draft"]["amount"] == 14.42, r2["draft"]
+    assert "以发票识别为准" in r2["answer"], r2["answer"]
+    print("[PASS] test_field_edit_fresh_upload_invoice_wins")
+
+
+def test_reason_digits_stay_in_reason():
+    #问题27（2026-10-30）：事由里的规格数字（A4/5箱/20支）不能被剥掉、更不能被当金额
+    a = _agent()
+    #① 补事由路径（await_reason）：裸数字原样保留在事由里
+    n = a._reason_from_answer("采购A4纸5箱、签字笔20支",
+                              {"department": "", "category": "", "city": ""})
+    assert n == "采购A4纸5箱、签字笔20支", n
+    #② 没有带单位的金额 → 金额不乱取（以前「A4」的4会被当成 ¥4）
+    f = a._extract_fields("采购A4纸5箱、签字笔20支")
+    assert f["amount"] == 0.0, f
+    #③ 带单位的金额照常识别 且事由截到金额前面
+    f2 = a._extract_fields("研发部，事由是123 800 元，有发票")
+    assert f2["amount"] == 800.0, f2
+    assert f2["reason"] == "123", f2
+    #④ 端到端：金额锁定 + 补事由 → 事由数字完整、发票金额不动
+    _backend()
+    actor = _actor()
+    base = {"applicant": "张三", "department": "财务部", "category": "办公用品",
+            "amount": 100.0, "has_invoice": "有票", "await_reason": True,
+            "amount_locked": True}
+    r = a._handle_fill("采购A4纸5箱、签字笔20支", base_draft=dict(base), actor=actor)
+    assert "A4" in r["draft"]["reason"], r["draft"]
+    assert r["draft"]["amount"] == 100.0, r["draft"]
+    print("[PASS] test_reason_digits_stay_in_reason")
+
+
+def test_amount_locked_text_digits_cannot_override():
+    #金额锁定（2026-10-30）：上传发票后 普通文字里的数字金额不再覆盖发票值
+    _backend()
+    a = _agent()
+    actor = _actor()
+    r1 = a.route("📎 发票已上传，请帮我填单", actor=actor,
+                 invoice_fields={"invoice_no": "N1", "invoice_seller": "某商贸",
+                                 "amount": 50.98, "source": "invoice", "upload_id": "uA"})
+    assert r1["draft"]["amount"] == 50.98, r1["draft"]
+    assert r1["draft"].get("amount_locked") is True, r1["draft"]
+    #同票据重复携带的下一轮 用户话里带别的数字 → 发票金额不动
+    r2 = a.route("事由是招待客户花了300元", base_draft=r1["draft"], actor=actor,
+                 invoice_fields={"invoice_no": "N1", "invoice_seller": "某商贸",
+                                 "amount": 50.98, "source": "invoice", "upload_id": "uA"})
+    assert r2["draft"]["amount"] == 50.98, r2["draft"]
+    #换新票据 → 金额跟随新发票（金额永远以最近一次识别的发票为准）
+    r3 = a.route("📎 发票已上传，请帮我填单", base_draft=r2["draft"], actor=actor,
+                 invoice_fields={"invoice_no": "N2", "invoice_seller": "某酒店",
+                                 "amount": 88.5, "source": "invoice", "upload_id": "uB"})
+    assert r3["draft"]["amount"] == 88.5, r3["draft"]
+    print("[PASS] test_amount_locked_text_digits_cannot_override")
+
+
+def test_invoice_status_still_not_text_editable():
+    #票据状态依旧不可被文字改（用户已拍板）但其他字段可以
+    _backend()
+    a = _agent()
+    actor = _actor()
+    r1 = a.route("📎 支付凭证已上传，请帮我填单", actor=actor,
+                 invoice_fields={"invoice_no": "", "invoice_seller": "某商贸",
+                                 "amount": 14.42, "source": "voucher", "upload_id": "u1"})
+    #用户说「无发票」→ 票据状态维持有票（不可改）
+    r2 = a.route("无发票", base_draft=r1["draft"], actor=actor)
+    assert r2["draft"]["has_invoice"] == "有票", r2["draft"]
+    assert "按「有票」计算" in r2["answer"], r2["answer"]
+    print("[PASS] test_invoice_status_still_not_text_editable")
 
 
 if __name__ == "__main__":
@@ -881,4 +1265,23 @@ if __name__ == "__main__":
     test_confirm_card_mentions_edit_path()
     test_after_submit_ask_guides_manual()
     test_fill_guide_button()
+    test_spoken_invoice_claim_does_not_count()
+    test_only_upload_fills_from_ocr_and_asks_missing()
+    test_text_then_upload_conflict_uses_invoice()
+    test_voucher_counts_as_invoiced()
+    test_existing_ticket_not_downgraded_by_spoken_no_invoice()
+    test_no_invoice_then_upload_evidence_becomes_invoiced()
+    test_complaint_about_amount_stays_in_fill_branch()
+    test_policy_question_in_fill_still_goes_consult()
+    test_text_edit_overrides_ocr_fields_except_invoice_status()
+    test_negation_correction_picks_new_value()
+    test_plain_affirmative_department_edit()
+    test_field_directed_edits_template()
+    test_field_edit_casual_phrasings()
+    test_field_edit_end_to_end_via_fill()
+    test_field_edit_protected_fields()
+    test_field_edit_fresh_upload_invoice_wins()
+    test_amount_locked_text_digits_cannot_override()
+    test_reason_digits_stay_in_reason()
+    test_invoice_status_still_not_text_editable()
     print("\n全部 M4 编排层单测通过")

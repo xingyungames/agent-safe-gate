@@ -156,6 +156,7 @@ public static class StoreNames
     public const string Outbox = "outbox.json";
     public const string Audit = "audit.jsonl";
     public const string InvoiceAi = "invoice_ai.json";
+    public const string Intercepts = "intercepts.json";
     public const string Datasets = "datasets";
     public const string Workspaces = "workspaces";
     public const string Blobs = "blobs";

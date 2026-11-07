@@ -67,18 +67,21 @@ public sealed class InvoiceService
     private readonly FeishuApi _api;
     private readonly VersionStore _versions;
     private readonly AuditLog _audit;
+    private readonly InterceptService _intercepts;
 
     //短期幂等：同一用户 90 秒内提交内容完全相同的单据，直接返回上一次结果（防连点/重试造成重复行）
     private readonly ConcurrentDictionary<string, (string RecordId, string BillNo, string Message, DateTime At)>
         _recentSubmits = new(StringComparer.Ordinal);
     private readonly ILogger<InvoiceService> _logger;
 
-    public InvoiceService(AppConfig cfg, FeishuApi api, VersionStore versions, AuditLog audit, ILogger<InvoiceService> logger)
+    public InvoiceService(AppConfig cfg, FeishuApi api, VersionStore versions, AuditLog audit,
+        InterceptService intercepts, ILogger<InvoiceService> logger)
     {
         _cfg = cfg;
         _api = api;
         _versions = versions;
         _audit = audit;
+        _intercepts = intercepts;
         _logger = logger;
     }
 
@@ -149,6 +152,22 @@ public sealed class InvoiceService
         string taskId, CancellationToken ct = default)
     {
         if (!Enabled) return InvoiceResult.Fail(DisabledReason);
+
+        //内容异常闸门：XSS / SQL 注入 / 提示词注入这类"正常员工不会写进事由"的东西
+        //命中即**不写飞书**，落拦截台账 + 审计，返回可追溯的拦截编号
+        var (anomaly, badField) = InvoiceAnomaly.ScanFields(
+            (InvoicePolicy.FieldReason, draft.Reason),
+            (InvoicePolicy.FieldInvoiceInfo, draft.InvoiceInfo));
+        if (anomaly.Hit)
+        {
+            var raw = string.Equals(badField, InvoicePolicy.FieldReason, StringComparison.Ordinal)
+                ? draft.Reason
+                : draft.InvoiceInfo;
+            var rec = await _intercepts.RecordAsync(identity, "submit", anomaly, badField, raw,
+                $"{draft.Type} / {draft.Amount:0.##} 元 / {draft.Department} / 票据={draft.InvoiceState}")
+                .ConfigureAwait(false);
+            return InvoiceResult.Fail(SuspiciousBlockedMessage(rec.Id, anomaly));
+        }
 
         var today = DateOnly.FromDateTime(DateTime.UtcNow.AddHours(8));   //按东八区取日期
         var error = InvoicePolicy.ValidateSubmit(draft, out var compliance, today);
@@ -270,6 +289,20 @@ public sealed class InvoiceService
         if (opinion.Trim().Length is < 2 or > 300)
             return InvoiceResult.Fail("审批意见需为 2 到 300 个字符");
 
+        //内容异常闸门：审批意见同样不允许夹带脚本/注入内容
+        var opAnomaly = InvoiceAnomaly.Scan(opinion);
+        if (opAnomaly.Hit)
+        {
+            var rec = await _intercepts.RecordAsync(identity, "review", opAnomaly,
+                InvoicePolicy.FieldReviewOpinion, opinion, $"单据={recordId} 目标状态={newStatus}")
+                .ConfigureAwait(false);
+            return InvoiceResult.Fail(SuspiciousBlockedMessage(rec.Id, opAnomaly));
+        }
+
+        //纯文本校验：审批意见同样会回流到前端展示，不允许夹带 HTML/脚本标记
+        if (InvoicePolicy.ContainsMarkup(opinion))
+            return InvoiceResult.Fail("审批意见" + InvoicePolicy.MarkupRejectedMessage);
+
         var fields = new Dictionary<string, object?>
         {
             [InvoicePolicy.FieldStatus] = newStatus,
@@ -333,7 +366,8 @@ public sealed class InvoiceService
     }
 
     //修改报销单字段
-    public async Task<InvoiceResult> UpdateAsync(RequestIdentity identity, string recordId,        IDictionary<string, string> patch, string taskId, CancellationToken ct = default)
+    public async Task<InvoiceResult> UpdateAsync(RequestIdentity identity, string recordId,
+        IDictionary<string, string> patch, string taskId, CancellationToken ct = default)
     {
         if (!Enabled) return InvoiceResult.Fail(DisabledReason);
 
@@ -341,6 +375,17 @@ public sealed class InvoiceService
         if (!ok || row is null) return InvoiceResult.Fail(error);
 
         if (patch.Count == 0) return InvoiceResult.Fail("没有任何要修改的字段");
+
+        //内容异常闸门：财务修改也可能被用来把脚本/注入内容写回单据
+        foreach (var (name, value) in patch)
+        {
+            var a = InvoiceAnomaly.Scan(value);
+            if (!a.Hit) continue;
+
+            var rec = await _intercepts.RecordAsync(identity, "update", a, name, value, $"单据={recordId}")
+                .ConfigureAwait(false);
+            return InvoiceResult.Fail(SuspiciousBlockedMessage(rec.Id, a));
+        }
 
         var fields = new Dictionary<string, object?>();
         foreach (var (name, value) in patch)
@@ -382,6 +427,8 @@ public sealed class InvoiceService
                 case InvoicePolicy.FieldReason:
                 case InvoicePolicy.FieldRiskSummary:
                     if (value.Length > 300) return InvoiceResult.Fail($"{name}不得超过 300 个字符");
+                    //纯文本校验：防止通过「财务修改」把脚本片段写回单据（存储型 XSS 的第二个入口）
+                    if (InvoicePolicy.ContainsMarkup(value)) return InvoiceResult.Fail(name + InvoicePolicy.MarkupRejectedMessage);
                     fields[name] = value;
                     break;
             }
@@ -614,9 +661,14 @@ public sealed class InvoiceService
     }
 
     //JSON 转一行
+    //拦截回执话术：告诉用户"没写进去、已记录、有编号"，避免用户以为提交成功而反复重试
+    private static string SuspiciousBlockedMessage(string interceptId, AnomalyResult anomaly)
+        => $"该单据内容包含疑似{anomaly.Category}内容（命中规则：{anomaly.Pattern}），"
+         + $"已拦截且**未写入飞书**，已记入拦截台账并上报管理员。"
+         + $"拦截编号 {interceptId}；如需正常报销，请只填写纯文本事由后重新提交。";
+
     //幂等键：用户 + 单据内容
-    private static string SubmitKey(RequestIdentity identity, InvoicePolicy.SubmitDraft d)
-        => string.Join('|',
+    private static string SubmitKey(RequestIdentity identity, InvoicePolicy.SubmitDraft d)        => string.Join('|',
             identity.User.Id, d.Department, d.Type, d.Amount.ToString("0.##"), d.Reason.Trim(),
             d.InvoiceState, d.City, d.InvoiceDate?.ToString("yyyy-MM-dd") ?? "", d.InvoiceInfo);
 

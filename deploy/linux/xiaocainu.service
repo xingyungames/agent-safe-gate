@@ -1,0 +1,41 @@
+[Unit]
+Description=XiaoCaiNu 对话式报销网关 (FastAPI)
+After=network-online.target ai-approval.service
+Wants=network-online.target ai-approval.service
+
+[Service]
+Type=simple
+User=ai-approval
+Group=ai-approval
+# 必须等于应用目录：knowledge/ 用的是相对路径（models/config.py: knowledge_dir()）
+WorkingDirectory=/opt/xiaocainu/app
+EnvironmentFile=/etc/ai-approval/xiaocainu.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONUTF8=1
+# 双保险：显式指定知识库绝对路径，避免以后改 WorkingDirectory 时静默丢知识库
+Environment=KNOWLEDGE_DIR=/opt/xiaocainu/app/knowledge
+
+ExecStart=/opt/xiaocainu/app/.venv/bin/python -m api.main 127.0.0.1 8000
+Restart=always
+RestartSec=2
+TimeoutStopSec=15
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xiaocainu
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# 网关本身无状态、不落盘；留一个空目录只为将来需要上传临时文件时不至于 500
+ReadWritePaths=/var/lib/xiaocainu
+
+[Install]
+WantedBy=multi-user.target

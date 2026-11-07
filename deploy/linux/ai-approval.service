@@ -1,0 +1,47 @@
+[Unit]
+Description=AI Approval Server (报销系统主服务器 / AI Agent 安全执行与审批平台)
+Documentation=file:///opt/ai-approval/app/appsettings.json
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ai-approval
+Group=ai-approval
+WorkingDirectory=/opt/ai-approval/app
+# 密钥、监听地址、数据目录、TrustedOrigins 全部来自这里（0600）
+EnvironmentFile=/etc/ai-approval/ai-approval.env
+
+# 自包含发布，服务器无需安装 .NET
+ExecStart=/opt/ai-approval/app/AiApprovalServer
+Restart=always
+RestartSec=2
+TimeoutStopSec=20
+# .NET 收到 SIGINT 会正常走优雅关闭
+KillSignal=SIGINT
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-approval
+
+# ---- 沙箱加固 ----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# 只有数据目录可写（JSON 库、审计链、快照、blobs 都在里面）
+ReadWritePaths=/var/lib/ai-approval
+
+# 注意：
+#  * 不要设 MemoryDenyWriteExecute=true —— .NET 的 JIT 需要可写可执行映射，开了必然启动失败。
+#  * 不要设 ProtectClock / PrivateDevices 之类的强隔离后再去排查随机数/证书问题，默认够用。
+#  * 若服务器是 ARM 或 musl 镜像，需重新 publish 对应 RID（linux-arm64 / linux-musl-x64）。
+
+[Install]
+WantedBy=multi-user.target

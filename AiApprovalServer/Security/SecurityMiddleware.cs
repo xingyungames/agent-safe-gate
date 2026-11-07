@@ -112,9 +112,13 @@ public sealed class SecurityMiddleware
             var body = await BufferBodyAsync(context).ConfigureAwait(false);
 
             //请求体 WAF：JSON body 同样要扫，否则注入特征只藏在 body 里就能绕过
-            if (_cfg.WafScanBody && body is { Length: > 0 })
+            ///api/agent/* 会合法写入网页/脚本内容，那里不启用 XSS 特征（其余特征照扫）
+            ///api/invoice/* 的内容异常由业务层统一判定（那里能拿到身份、能记拦截台账），此处不重复拦截
+            var skipBodyWaf = path.StartsWith("/api/invoice/", StringComparison.OrdinalIgnoreCase);
+            if (_cfg.WafScanBody && !skipBodyWaf && body is { Length: > 0 })
             {
-                var bodyHit = WafPatterns.ScanBody(Encoding.UTF8.GetString(body));
+                var includeXss = !path.StartsWith("/api/agent/", StringComparison.OrdinalIgnoreCase);
+                var bodyHit = WafPatterns.ScanBody(Encoding.UTF8.GetString(body), includeXss);
                 if (bodyHit is not null)
                 {
                     var bannedBody = _guard.Strike(ip, $"WAF 命中请求体 {bodyHit}", weight: 2, waf: true);

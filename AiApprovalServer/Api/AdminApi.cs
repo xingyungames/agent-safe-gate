@@ -15,7 +15,7 @@ public static class AdminApi
 
         group.MapGet("/overview", async (HttpContext context, TaskService tasks, UserService users,
             VersionStore versions, Outbox outbox, AuditLog audit, SecurityGuard guard, AiClient ai,
-            DatasetStore datasets) =>
+            DatasetStore datasets, InterceptService intercepts) =>
         {
             var all = await tasks.ListAsync(null, null, 300);
             var pending = all.Where(t => t.Status == TaskState.PendingApproval).OrderByDescending(t => t.CreatedAt).ToList();
@@ -36,6 +36,7 @@ public static class AdminApi
                 auditChainOk = chain.Ok,
                 auditChainMessage = chain.Message,
                 outboxCount = (await outbox.ListAsync(null, 300)).Count,
+                interceptPendingCount = await intercepts.CountPendingAsync(),
                 aiConfigured = ai.IsConfigured,
                 aiModel = ai.Model,
                 security = guard.Snapshot(),
@@ -787,6 +788,60 @@ public static class AdminApi
                 dropped = outcome.Dropped.Select(d => new { recordId = d.RecordId, droppedReason = d.DroppedReason }).ToList(),
             });
         });
+
+        //拦截台账：内容异常（XSS / SQL 注入 / 提示词注入）被拦下、**未写入飞书**的单据
+        group.MapGet("/intercepts", async (HttpContext context, InterceptService intercepts, string? handled, int? limit) =>
+        {
+            var identity = Api.Identity(context);
+            if (identity is null) return Api.Error(401, "UNAUTHENTICATED", "请先登录");
+            if (!Roles.IsAdminSide(identity.User.Role))
+                return Api.Error(403, "FORBIDDEN", "只有管理员可以查看拦截台账");
+
+            var list = await intercepts.ListAsync(handled, limit ?? 100);
+            return Api.Ok(new
+            {
+                pending = await intercepts.CountPendingAsync(),
+                count = list.Count,
+                note = "这些单据因内容异常被拦截，没有写入飞书；原始内容与命中规则可用于追溯",
+                rows = list.Select(r => new
+                {
+                    id = r.Id,
+                    createdAt = r.CreatedAt,
+                    userName = r.UserName,
+                    displayName = r.DisplayName,
+                    employeeId = r.EmployeeId,
+                    roleLabel = Roles.Label(r.Role),
+                    ip = r.Ip,
+                    action = r.Action,
+                    category = r.Category,
+                    pattern = r.Pattern,
+                    field = r.Field,
+                    snippet = r.Snippet,
+                    payload = r.Payload,
+                    context = r.Context,
+                    handled = r.Handled,
+                    handledBy = r.HandledBy,
+                    handledAt = r.HandledAt,
+                    note = r.Note,
+                }).ToList(),
+            });
+        });
+
+        //标记拦截记录的处理结果：confirmed（确认恶意）/ falsePositive（误报）/ ignored
+        group.MapPost("/intercepts/{id}/handle", async (HttpContext context, string id, InterceptService intercepts) =>
+        {
+            var identity = Api.Identity(context);
+            if (identity is null) return Api.Error(401, "UNAUTHENTICATED", "请先登录");
+            if (!Roles.IsAdminSide(identity.User.Role))
+                return Api.Error(403, "FORBIDDEN", "只有管理员可以处理拦截记录");
+
+            var body = Api.ReadBody<InterceptHandleRequest>(context);
+            if (body is null) return Api.Error(400, "BAD_REQUEST", "请求体格式错误");
+
+            var (ok, error) = await intercepts.HandleAsync(Api.Clean(id, 64),
+                Api.Clean(body.State, 20), Api.Clean(body.Note, 200), identity);
+            return ok ? Api.Ok(new { message = "已记录处理结果" }) : Api.Error(400, "HANDLE_FAILED", error);
+        });
     }
 
     private static bool AdminWriteAllowed(SecurityGuard guard, RequestIdentity identity, out string message)
@@ -834,4 +889,12 @@ public static class AdminApi
 public sealed class DisableRequest
 {
     public bool Disabled { get; set; }
+}
+
+//拦截台账处理请求
+public sealed class InterceptHandleRequest
+{
+    //confirmed（确认恶意）/ falsePositive（误报）/ ignored
+    public string State { get; set; } = "";
+    public string Note { get; set; } = "";
 }

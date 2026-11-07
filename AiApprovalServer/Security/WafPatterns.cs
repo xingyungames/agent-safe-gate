@@ -92,8 +92,18 @@ public static class WafPatterns
             RegexOptions.Compiled, Timeout)),
     };
 
+    //XSS 特征（只对业务文本接口启用）
+    ///api/agent/* 会合法写入 HTML/脚本文件内容，那里必须关掉，否则"帮我写个网页"都提交不了
+    private static readonly (string Label, Regex Rx)[] BodyXssRules =
+    {
+        ("XSS", new Regex(
+            @"(?i)(<\s*script|javascript\s*:|vbscript\s*:|\bon(error|load|click|mouseover|focus|submit|mouseenter)\s*=|<\s*iframe|<\s*svg|<\s*embed|<\s*object|document\.cookie|window\.location\s*=|eval\s*\()",
+            RegexOptions.Compiled, Timeout)),
+    };
+
     //扫描请求体：先还原 \\uXXXX 与一层 %XX，堵住编码绕过
-    public static string? ScanBody(string? text)
+    //includeXss=false 用于 /api/agent/*（用户会合法地让 AI 写网页/脚本内容），业务文本接口一律开启
+    public static string? ScanBody(string? text, bool includeXss = true)
     {
         if (string.IsNullOrEmpty(text)) return null;
 
@@ -101,6 +111,20 @@ public static class WafPatterns
         var decoded = DecodeOnce(DecodeUnicode(sample));
 
         foreach (var (label, rx) in BodyRules)
+        {
+            try
+            {
+                if (rx.IsMatch(decoded)) return label;
+            }
+            catch (RegexMatchTimeoutException)
+            {
+                return label + "（正则匹配超时，疑似 ReDoS 探测）";
+            }
+        }
+
+        if (!includeXss) return null;
+
+        foreach (var (label, rx) in BodyXssRules)
         {
             try
             {

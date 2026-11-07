@@ -91,6 +91,22 @@ public static class InvoicePolicy
 
     //合规预审
 
+    //文本字段是否含 HTML/脚本标记字符
+    //事由、发票信息、审批意见都是纯业务文本，不该出现尖括号。一旦放行，
+    //脚本片段会被当作合法数据持久化到飞书，任何「读出来后直接当 HTML 渲染」的下游都会中招（存储型 XSS）
+    public static bool ContainsMarkup(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        foreach (var ch in text)
+        {
+            if (ch is '<' or '>' or '\0') return true;
+        }
+        return false;
+    }
+
+    //统一拒绝话术
+    public const string MarkupRejectedMessage = "不能包含 < 或 > 字符（疑似 HTML/脚本标记），请只填写纯文本";
+
     //预审结论
     public sealed record Compliance(bool Submittable, string Result, string RiskSummary, string? RejectReason);
 
@@ -154,6 +170,9 @@ public static class InvoicePolicy
         if (draft.Reason.Trim().Length is < 2 or > 200)
             return "事由需为 2 到 200 个字符，请写清真实业务用途";
 
+        //纯文本校验：挡住「把脚本片段当业务数据存进去」的存储型 XSS
+        if (ContainsMarkup(draft.Reason)) return "事由" + MarkupRejectedMessage;
+
         if (draft.Type == "差旅费")
         {
             if (string.IsNullOrWhiteSpace(draft.City))
@@ -168,6 +187,8 @@ public static class InvoicePolicy
 
         if (draft.InvoiceInfo.Length > 128)
             return "发票信息（号码；销售方）不得超过 128 个字符";
+
+        if (ContainsMarkup(draft.InvoiceInfo)) return "发票信息" + MarkupRejectedMessage;
 
         compliance = Evaluate(draft.Type, draft.Amount, draft.InvoiceState, draft.City, draft.InvoiceDate, today);
         return compliance.Submittable ? null : compliance.RejectReason;

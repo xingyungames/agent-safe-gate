@@ -53,6 +53,7 @@ builder.Services.AddSingleton<ApprovalSigner>();
 builder.Services.AddSingleton(new SecurityGuard(cfg.Limits, cfg.NonceWindowSeconds, cfg.AllowlistIps));
 builder.Services.AddSingleton<FeishuApi>();
 builder.Services.AddSingleton<FeishuMirror>();
+builder.Services.AddSingleton<InterceptService>();
 builder.Services.AddSingleton<InvoiceService>();
 builder.Services.AddSingleton<UserService>();
 builder.Services.AddSingleton<PathGuard>();

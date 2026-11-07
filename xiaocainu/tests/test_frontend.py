@@ -85,8 +85,20 @@ def test_injection_blocked_via_http():
     print("[PASS] test_injection_blocked_via_http")
 
 
+def test_frontend_sends_upload_id():
+    #前端必须给每次上传带唯一 upload_id
+    #否则后端分不清「新上传」和「同一份票据被反复捎带」→ 用户改的字段会被票据值盖回去
+    with open(FRONTEND, encoding="utf-8") as f:
+        content = f.read()
+    assert "upload_id" in content, "前端未带 upload_id"
+    assert "payload.upload_id" in content, "前端未把 upload_id 放进 /chat 请求体"
+    assert "uploadId" not in content or "upload_id" in content, "upload_id 命名应统一"
+    print("[PASS] test_frontend_sends_upload_id")
+
+
 if __name__ == "__main__":
     test_frontend_file_exists()
     test_frontend_served()
     test_injection_blocked_via_http()
+    test_frontend_sends_upload_id()
     print("\n全部 M6 前端 / 网关托管单测通过")

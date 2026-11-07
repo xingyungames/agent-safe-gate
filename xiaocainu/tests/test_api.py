@@ -106,7 +106,8 @@ def test_chat_fill_merges_draft():
                        a, s, auth=auth, token=tok)
     assert code == 200 and p["intent"] == "B"
     assert p["draft"] and p["draft"].get("department") == "研发部"
-    code, p = dispatch("POST", "/chat", {"session_id": "f1", "text": "800 有发票 上海 事由是出差谈客户"},
+    code, p = dispatch("POST", "/chat", {"session_id": "f1", "text": "800 上海 事由是出差谈客户",
+                                          "invoice_no": "2311", "invoice_seller": "某商贸"},
                        a, s, auth=auth, token=tok)
     assert p["intent"] == "B"
     assert p["draft"]["amount"] == 800 and p["draft"]["city"] == "上海"
@@ -557,6 +558,67 @@ def test_chat_invalid_image_400():
     print("[PASS] test_chat_invalid_image_400")
 
 
+def test_chat_request_model_keeps_all_ocr_fields():
+    #回归：Pydantic 会丢弃未声明字段
+    #ChatRequest 少声明一个 OCR 字段 前端传的金额/日期/类型/城市/来源就被静默丢掉
+    #（曾导致 OCR 明明识别出 ¥14.42，填单卡里金额却是空的）
+    from api.main import ChatRequest
+    raw = {
+        "session_id": "s1", "text": "发票已上传，请帮我填单",
+        "invoice_no": "2311", "invoice_seller": "某商贸",
+        "amount": 14.42, "invoice_date": "2026/10/23",
+        "category": "招待费", "city": "南京", "source": "voucher",
+    }
+    dumped = ChatRequest(**raw).model_dump()
+    for k, v in raw.items():
+        if k == "text":
+            continue
+        assert k in dumped, f"{k} 被 Pydantic 丢弃了（未在 ChatRequest 中声明）"
+        assert dumped[k] == v, f"{k} 值被改写: {dumped[k]!r} != {v!r}"
+    #空串金额要归一成 None 而不是报 422
+    assert ChatRequest(text="x", amount="").model_dump()["amount"] is None
+    #越界金额要被拒
+    try:
+        ChatRequest(text="x", amount=-1)
+        raise AssertionError("负数金额应被拒绝")
+    except Exception:
+        pass
+    print("[PASS] test_chat_request_model_keeps_all_ocr_fields")
+
+
+def test_chat_ocr_amount_reaches_draft_via_http():
+    #回归：OCR 识别出的金额必须能经真实 HTTP 层进入草稿
+    from fastapi.testclient import TestClient
+    auth, _ = _setup()
+    apimod.AUTH = auth
+    apimod.AGENT = _agent()
+    tok = _tok(auth, *EMP)
+    client = TestClient(app)
+    r = client.post("/chat", json={
+        "session_id": "amt1", "text": "📎 发票已上传，请帮我填单",
+        "invoice_no": "2311", "invoice_seller": "江苏京东信息技术有限公司",
+        "amount": 14.42, "invoice_date": "2026/10/23",
+        "category": "招待费", "source": "voucher",
+    }, headers={"Authorization": tok})
+    assert r.status_code == 200, r.text
+    d = r.json()["draft"]
+    assert d["amount"] == 14.42, f"金额没进草稿: {d}"
+    assert d["date"] == "2026/10/23", d
+    assert d["category"] == "招待费", d
+    assert d.get("invoice_source") == "voucher", d
+    assert d["has_invoice"] == "有票", d
+    print("[PASS] test_chat_ocr_amount_reaches_draft_via_http")
+
+
+def test_chat_upload_id_survives_request_model():
+    #回归：upload_id 必须过 Pydantic 模型 不然后端分不清新上传/重复捎带
+    from api.main import ChatRequest
+    d = ChatRequest(text="x", upload_id="u123", amount=14.42).model_dump()
+    assert d["upload_id"] == "u123", d
+    assert d["amount"] == 14.42, d
+    print("[PASS] test_chat_upload_id_survives_request_model")
+
+
 if __name__ == "__main__":
     test_health()
     test_chat_consult_offline()
@@ -586,5 +648,8 @@ if __name__ == "__main__":
     test_decode_image_helpers()
     test_chat_confirm_with_image_attaches_invoice()
     test_chat_invalid_image_400()
+    test_chat_request_model_keeps_all_ocr_fields()
+    test_chat_ocr_amount_reaches_draft_via_http()
+    test_chat_upload_id_survives_request_model()
     test_http_server_smoke()
     print("\n全部 M5 API 网关单测通过")

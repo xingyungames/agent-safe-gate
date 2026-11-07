@@ -21,7 +21,8 @@ _DATE_FORMATS = ("%Y/%m/%d", "%Y-%m-%d", "%Y.%m.%d", "%Y年%m月%d日", "%Y%m%d"
 _EXTRACT_PROMPT = (
     "你是企业财务发票识别引擎。请识别这张图片中的发票/收据/消费凭证关键字段，"
     "只输出一个 JSON 对象，不要输出任何其他文字：\n"
-    '{"amount": 数字, 发票含税总金额(单位元), 无法识别用 null, '
+    '{"amount": 数字, 发票含税总金额(单位元)，取「价税合计/合计金额」那一栏，'
+    '不要把税额、单价、小计当成总金额，保留两位小数，无法识别用 null, '
     '"invoice_date": "开票日期 YYYY/M/D", 无法识别用空串, '
     '"invoice_no": "发票号码", 无则空串, '
     '"seller": "销售方名称", 无则空串, '
@@ -48,6 +49,7 @@ class OCRResult:
     model: str = ""
     provider: str = ""
     latency_ms: int = 0
+    source: str = ""  # invoice=识别到发票号；voucher=有金额/日期但无票号（支付凭证）；unknown=未知
 
     @property
     def invoice_info(self) -> str:
@@ -98,7 +100,41 @@ def normalize_invoice_date(raw: object) -> str:
             return f"{dt.year}/{dt.month}/{dt.day}"
         except ValueError:
             continue
+    #兜底正则：容忍混入时间/前后缀文字（"2026/10/1 12:30"、"开票日期：2026年10月1日"）
+    m = re.search(r"(\d{4})\s*[/\-.年]\s*(\d{1,2})\s*[/\-.月]\s*(\d{1,2})", s)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 2000 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y}/{mo}/{d}"
     return ""
+
+
+def _parse_amount(raw: object) -> tuple[Optional[float], str]:
+    #宽容解析金额："1,234.56" "¥88.50元" " 1234 " → 1234.56
+    #返回 (金额, 失败原因)；无法解析/越界返回 (None, 原因)，空值返回 (None, "")
+    if raw is None:
+        return None, ""
+    if isinstance(raw, bool):
+        return None, f"金额无法解析({raw})"
+    if isinstance(raw, (int, float)):
+        v = float(raw)
+        if 0 <= v <= 1e7:
+            return v, ""
+        return None, f"金额越界({raw})"
+    s = str(raw).strip()
+    if not s:
+        return None, ""
+    #剥货币符/单位/千分位/空白（全半角逗号都收）
+    s = (s.replace("￥", "").replace("¥", "").replace("元", "")
+          .replace(",", "").replace("，", "").replace(" ", "").replace("　", "")
+          .replace("－", "-").replace("—", "-"))
+    try:
+        v = float(s)
+    except ValueError:
+        return None, f"金额无法解析({raw})"
+    if not (0 <= v <= 1e7):
+        return None, f"金额越界({raw})"
+    return v, ""
 
 
 def sanitize_fields(parsed: dict) -> tuple[Dict[str, object], List[str]]:
@@ -108,15 +144,11 @@ def sanitize_fields(parsed: dict) -> tuple[Dict[str, object], List[str]]:
     out["amount"] = None
 
     raw_amount = parsed.get("amount")
-    if raw_amount is not None:
-        try:
-            amt = float(raw_amount)
-            if 0 <= amt <= 1e7:
-                out["amount"] = amt
-            else:
-                warnings.append(f"金额越界({raw_amount})已置空，请人工确认")
-        except (TypeError, ValueError):
-            warnings.append(f"金额无法解析({raw_amount})已置空，请人工确认")
+    amt, amt_warn = _parse_amount(raw_amount)
+    if amt is not None:
+        out["amount"] = amt
+    elif amt_warn:
+        warnings.append(amt_warn + "，请人工确认")
 
     out["invoice_date"] = normalize_invoice_date(parsed.get("invoice_date"))
     if parsed.get("invoice_date") and not out["invoice_date"]:
@@ -240,16 +272,27 @@ class InvoiceOCREngine:
                 "（微信/支付宝「账单详情」页）")
 
         fields, warnings = sanitize_fields(parsed)
+        source = _decide_source(fields)
         usage = {}
         if getattr(resp, "usage", None):
             try:
                 usage = resp.usage.model_dump()
             except Exception:
                 usage = {}
-        logger.info("发票OCR完成 model=%s latency=%sms warnings=%s",
-                    self.model, latency, warnings)
+        logger.info("发票OCR完成 model=%s latency=%sms warnings=%s source=%s",
+                    self.model, latency, warnings, source)
         return OCRResult(fields=fields, warnings=warnings, usage=usage,
-                         model=self.model, provider=self.name, latency_ms=latency)
+                         model=self.model, provider=self.name, latency_ms=latency,
+                         source=source)
+
+
+def _decide_source(fields: Dict[str, object]) -> str:
+    #识别结果来源：有票号=发票；有金额/日期但无票号=支付凭证；否则未知
+    if str(fields.get("invoice_no") or "").strip():
+        return "invoice"
+    if fields.get("amount") is not None or str(fields.get("invoice_date") or "").strip():
+        return "voucher"
+    return "unknown"
 
 
 class MockOcrEngine:
@@ -276,4 +319,5 @@ class MockOcrEngine:
                            "content_type": content_type, "filename": filename})
         fields, warnings = sanitize_fields(dict(self.canned))
         return OCRResult(fields=fields, warnings=warnings, model="mock-ocr-model",
-                         provider=self.name, latency_ms=5)
+                         provider=self.name, latency_ms=5,
+                         source=_decide_source(fields))

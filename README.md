@@ -446,6 +446,12 @@ AISERVER_LISTEN_URL=http://0.0.0.0:6616 ./AiApprovalServer
 
 生产建议：用 systemd 托管 + 防火墙只放行 6616 + `App_Data/` 单独备份（里面是账号库与审计链）。
 
+> **完整 Linux 部署套件见 [deploy/linux/](deploy/linux/)**：`systemd` 单元（主服务器 + 网关各一个）、`nginx` 反向代理与 TLS 示例、
+> `/etc` 下的 env 模板、以及幂等的 `install.sh` 一键安装/升级脚本，配套逐步手册（目录规划、密钥注入、来源校验、验收三跳、升级备份回滚）。
+>
+> 注意本节"`AISERVER_LISTEN_URL=http://0.0.0.0:6616`"只是演示直连；**生产必须保持只监听回环**并由反向代理终止 TLS，
+> 理由与后果见 [docs/部署与配置.md](docs/部署与配置.md) 第九节（客户端 IP 只认 TCP 对端、TLS 在代理终止会让写请求 `403 BAD_ORIGIN`）。
+
 **升级时只替换程序与前端，保留配置与数据**：
 
 ```bash

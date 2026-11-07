@@ -199,9 +199,160 @@
     return badge(text, cls);
   }
 
-  //加载报销单 AI 建议（只读：本页没有任何执行入口）
-  function loadInvoiceAi(body) {
+  //拦截台账：内容异常被拦下、**没有写入飞书**的单据
+  function loadIntercepts(body) {
     U.clear(body);
+
+    var note = el('div', 'banner warn');
+    note.textContent = '下表是「内容异常被拦下、没有写入飞书」的单据。点「处理」可查看原始内容与命中规则，并标记处理结果。';
+    body.appendChild(note);
+
+    var bar = el('div', 'row');
+    var filter = document.createElement('select');
+    [['pending', '仅待处理'], ['', '全部'], ['confirmed', '确认恶意'], ['falsePositive', '误报'], ['ignored', '已忽略']]
+      .forEach(function (o) {
+        var opt = document.createElement('option');
+        opt.value = o[0];
+        opt.textContent = o[1];
+        filter.appendChild(opt);
+      });
+    bar.appendChild(filter);
+
+    var refresh = el('button', 'small', '刷新');
+    refresh.type = 'button';
+    bar.appendChild(refresh);
+
+    var stat = el('span', 'hint');
+    bar.appendChild(stat);
+    body.appendChild(bar);
+
+    var host = el('div', 'list');
+    host.textContent = '加载中…';
+    body.appendChild(host);
+
+    function render(rows) {
+      U.clear(host);
+      if (!rows.length) {
+        host.appendChild(el('div', 'empty', '没有拦截记录'));
+        return;
+      }
+
+      var t = el('table');
+      var thead = el('thead');
+      var hr = el('tr');
+      ['时间', '账号', '工号', '来源 IP', '类别', '命中规则', '字段', '命中片段', '状态', '操作'].forEach(function (x) {
+        hr.appendChild(el('th', null, x));
+      });
+      thead.appendChild(hr);
+      t.appendChild(thead);
+
+      var tb = el('tbody');
+      rows.forEach(function (r) {
+        var tr = el('tr');
+        tr.appendChild(el('td', null, U.fmtTime(r.createdAt)));
+        tr.appendChild(el('td', null, (r.displayName || r.userName || '') + '（' + (r.userName || '') + '）'));
+        tr.appendChild(el('td', null, r.employeeId || '-'));
+        tr.appendChild(el('td', null, r.ip || '-'));
+
+        var c = el('td');
+        c.appendChild(badge(r.category || '-', 'bad'));
+        tr.appendChild(c);
+
+        tr.appendChild(el('td', null, r.pattern || '-'));
+        tr.appendChild(el('td', null, r.field || '-'));
+        tr.appendChild(el('td', null, r.snippet || '-'));
+
+        var st = el('td');
+        st.textContent = r.handled === 'pending' ? '待处理'
+          : r.handled === 'confirmed' ? '确认恶意'
+            : r.handled === 'falsePositive' ? '误报' : '已忽略';
+        tr.appendChild(st);
+
+        var op = el('td');
+        if (r.handled === 'pending') {
+          var btn = el('button', 'small ghost', '处理');
+          btn.type = 'button';
+          btn.addEventListener('click', function () { openHandle(r); });
+          op.appendChild(btn);
+        }
+        tr.appendChild(op);
+
+        tb.appendChild(tr);
+      });
+      t.appendChild(tb);
+      host.appendChild(t);
+    }
+
+    function openHandle(r) {
+      var box = el('div');
+      var lines = [
+        ['拦截编号', r.id],
+        ['时间', U.fmtTime(r.createdAt)],
+        ['账号', (r.displayName || '') + '（' + r.userName + '，' + r.employeeId + '）'],
+        ['角色', r.roleLabel],
+        ['来源 IP', r.ip],
+        ['动作', r.action],
+        ['类别', r.category + ' / ' + r.pattern],
+        ['字段', r.field],
+        ['单据摘要', r.context]
+      ];
+      lines.forEach(function (kv) {
+        var row = el('div', 'action-card');
+        row.appendChild(el('span', null, kv[0] + '：' + (kv[1] || '-')));
+        box.appendChild(row);
+      });
+
+      box.appendChild(el('div', 'hint', '原始内容（原样展示，未做任何渲染）：'));
+      var pre = el('pre', 'code', r.payload || '');
+      box.appendChild(pre);
+
+      var remark = document.createElement('input');
+      remark.type = 'text';
+      remark.maxLength = 200;
+      remark.placeholder = '备注（可选）';
+      box.appendChild(remark);
+
+      function mark(state) {
+        var payload = { state: state, note: remark.value.trim() };
+        API.post('/api/admin/intercepts/' + encodeURIComponent(r.id) + '/handle', payload)
+          .then(function (res) {
+            U.toast(res.data.message || '已记录', 'ok');
+            U.clear(document.getElementById('modal-host'));
+            load();
+          })
+          .catch(function (err) { U.toast(err.message, 'bad'); });
+      }
+
+      var foot = el('div', 'row');
+      [['confirmed', '确认恶意'], ['falsePositive', '误报'], ['ignored', '忽略']].forEach(function (x) {
+        var b = el('button', 'small', x[1]);
+        b.type = 'button';
+        b.addEventListener('click', function () { mark(x[0]); });
+        foot.appendChild(b);
+      });
+
+      openModal('拦截记录 · ' + r.id, box, foot);
+    }
+
+    function load() {
+      host.textContent = '加载中…';
+      var q = filter.value ? ('?handled=' + encodeURIComponent(filter.value)) : '';
+      API.get('/api/admin/intercepts' + q).then(function (res) {
+        var d = res.data || {};
+        stat.textContent = '待处理 ' + (d.pending || 0) + ' 条 / 本次显示 ' + (d.count || 0) + ' 条';
+        render(d.rows || []);
+      }).catch(function (err) {
+        host.textContent = '加载失败：' + err.message;
+      });
+    }
+
+    refresh.addEventListener('click', load);
+    filter.addEventListener('change', load);
+    load();
+  }
+
+  //加载报销单 AI 建议（只读：本页没有任何执行入口）
+  function loadInvoiceAi(body) {    U.clear(body);
 
     var note = el('div', 'banner info');
     note.textContent = '管理台只展示 AI 建议。系统不存在由 AI 触发审批或执行的接口：' +
@@ -342,6 +493,7 @@
       case 'outbox': loadOutbox(body); break;
       case 'datasets': loadDatasets(body); break;
       case 'invoiceai': loadInvoiceAi(body); break;
+      case 'intercepts': loadIntercepts(body); break;
       case 'security': loadSecurity(body); break;
       default: body.textContent = '未知标签';
     }

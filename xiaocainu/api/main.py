@@ -6,7 +6,7 @@ import sys
 import base64
 from typing import Any, Dict, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -40,8 +40,25 @@ class ChatRequest(BaseModel):
     image_b64: str = Field(default="", max_length=12_000_000)
     image_mime: str = Field(default="image/jpeg", max_length=32)
     #OCR 发票字段 前端回传
+    # ⚠️ 这几个字段必须全部声明：Pydantic v2 默认丢弃未声明字段（extra='ignore'），
+    #    少声明一个就会被 model_dump() 静默丢掉，OCR 明明识别出来了却传不进 agent。
     invoice_no: str = Field(default="", max_length=64)
     invoice_seller: str = Field(default="", max_length=64)
+    amount: float | None = Field(default=None, ge=0, le=10_000_000)
+    invoice_date: str = Field(default="", max_length=24)
+    category: str = Field(default="", max_length=16)
+    city: str = Field(default="", max_length=16)
+    source: str = Field(default="", max_length=16)  #invoice/voucher/unknown
+    #本次上传的唯一标识 区分「新上传」与「同一份票据被反复捎带」
+    upload_id: str = Field(default="", max_length=64)
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def _blank_amount_to_none(cls, v):
+        #前端可能回传空串表示「未识别到金额」 不能让它触发 422
+        if v is None or v == "":
+            return None
+        return v
 
 
 class OcrRequest(BaseModel):
@@ -261,9 +278,19 @@ def dispatch(method: str, path: str, body: Dict[str, Any], agent: XiaoCaiAgent,
             image_mime = real_mime
             image_b64 = base64.b64encode(raw).decode()  #归一为裸 base64
         invoice_fields = None
-        if body.get("invoice_no") or body.get("invoice_seller"):
-            invoice_fields = {"invoice_no": str(body.get("invoice_no") or "")[:64],
-                              "invoice_seller": str(body.get("invoice_seller") or "")[:64]}
+        if (body.get("invoice_no") or body.get("invoice_seller")
+                or body.get("amount") or body.get("category") or body.get("source")):
+            invoice_fields = {
+                "invoice_no": str(body.get("invoice_no") or "")[:64],
+                "invoice_seller": str(body.get("invoice_seller") or "")[:64],
+                "amount": body.get("amount"),
+                "date": str(body.get("invoice_date") or body.get("date") or "")[:24],
+                "category": str(body.get("category") or "")[:16],
+                "city": str(body.get("city") or "")[:16],
+                "source": body.get("source") or "",
+                #本次上传的唯一标识 用来区分「新上传」与「同一份票据被反复捎带」
+                "upload_id": str(body.get("upload_id") or "")[:64],
+            }
         #业务处理
         history = store.get_messages(sid)
         base_draft = store.get_draft(sid)
@@ -308,6 +335,7 @@ def dispatch(method: str, path: str, body: Dict[str, Any], agent: XiaoCaiAgent,
             "warnings": result.warnings,
             "preview": build_invoice_preview(fields),
             "invoice_info": result.invoice_info,
+            "source": result.source,
             "mime": mime,
             "usage": result.usage,
             "model": result.model,

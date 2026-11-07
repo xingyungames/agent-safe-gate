@@ -214,7 +214,7 @@
 <script>
   // ---------- 内存级会话（不持久化，刷新/新对话即清空） ----------
   let sessionId = "web-" + Math.random().toString(36).slice(2, 12);
-  let pendingInvoice = null;  // M9 暂存发票 {b64,mime,filename,invoice_no,invoice_seller}，随对话请求捎带，提交成功即清
+  let pendingInvoice = null;  // M9 暂存发票 {b64,mime,filename,invoice_no,invoice_seller,upload_id}，随对话请求捎带，提交成功即清
   const windowEl = document.getElementById("window");
   const inputEl = document.getElementById("input");
   const sendBtn = document.getElementById("sendBtn");
@@ -450,6 +450,12 @@
         payload.image_mime = pendingInvoice.mime;
         payload.invoice_no = pendingInvoice.invoice_no || "";
         payload.invoice_seller = pendingInvoice.invoice_seller || "";
+        payload.amount = pendingInvoice.amount;
+        payload.invoice_date = pendingInvoice.date || "";
+        payload.category = pendingInvoice.category || "";
+        payload.city = pendingInvoice.city || "";
+        payload.source = pendingInvoice.source || "";
+        payload.upload_id = pendingInvoice.upload_id || "";
       }
       const resp = await fetch("/chat", {
         method: "POST",
@@ -520,7 +526,9 @@
     html += '<div class="records"><div class="rec">';
     rows.forEach(([k, v]) => { html += escapeHtml(k) + "：" + escapeHtml(String(v)) + "<br>"; });
     html += "</div></div>";
-    html += "🤖 识别引擎：" + escapeHtml(d.model || "-") + " · 已自动预填，缺啥补啥，没问题回「确认提交」~";
+    const tag = (d.source === "voucher") ? "支付凭证" : "发票";
+    html += "🤖 识别引擎：" + escapeHtml(d.model || "-") + " · 已识别为" + tag
+          + "并自动预填，缺啥补啥，没问题回「确认提交」~";
     return html;
   }
 
@@ -551,15 +559,26 @@
       const data = await resp.json().catch(() => ({}));
       if (typing && typing.parentNode) typing.parentNode.remove();
       if (resp.ok && data.ok) {
+        const fields = data.fields || {};
+        const isVoucher = data.source === "voucher";
         pendingInvoice = {
           b64: b64,
           mime: data.mime || file.type || "image/jpeg",
           filename: file.name,
-          invoice_no: (data.fields && data.fields.invoice_no) || "",
-          invoice_seller: (data.fields && data.fields.seller) || "",
+          invoice_no: fields.invoice_no || "",
+          invoice_seller: fields.seller || "",
+          amount: (fields.amount != null && fields.amount !== "") ? fields.amount : "",
+          date: fields.invoice_date || "",
+          category: fields.rtype || "",
+          city: fields.city || "",
+          source: data.source || (fields.invoice_no ? "invoice" : (isVoucher ? "voucher" : "")),
+          //本次上传的唯一标识：后端据此判断「新上传」还是「同一份票据被反复捎带」
+          //后者不能覆盖用户已经改过的金额/类型
+          upload_id: "u" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
         };
         addMessage("bot", renderOcrCard(data));
-        if (data.preview) await send(data.preview);  // 一句话预填 → B 分支自动合并追问
+        // 结构化字段经 /chat 的 invoice_fields 直传，不再用 preview 句子二次解析
+        await send(isVoucher ? "📎 支付凭证已上传，请帮我填单" : "📎 发票已上传，请帮我填单");
       } else if (resp.status === 401) {
         handle401("登录已过期，请重新登录");
       } else if (resp.status === 429) {

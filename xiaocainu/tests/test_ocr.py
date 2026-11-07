@@ -70,6 +70,27 @@ def test_sanitize_amount_bounds():
     assert len(w1) == 1 and len(w2) == 1 and w3 == []
 
 
+def test_amount_tolerant_parsing():
+    #金额宽容解析（2026-10-30 提取强化）：千分位/货币符/单位/空白 全收
+    for raw, expect in (("1,234.56", 1234.56), ("¥88.50元", 88.5), (" 1234 ", 1234.0),
+                        ("1，234", 1234.0), (1234, 1234.0), ("56.80", 56.8)):
+        fields, warnings = sanitize_fields({"amount": raw})
+        assert fields["amount"] == expect, (raw, fields, warnings)
+        assert warnings == [], (raw, warnings)
+    #空串不算错 不告警（LLM 没识别到金额时返回空串/null）
+    fields, warnings = sanitize_fields({"amount": ""})
+    assert fields["amount"] is None and warnings == [], (fields, warnings)
+
+
+def test_date_fallback_with_noise():
+    #日期兜底正则（2026-10-30 提取强化）：混入时间/前后缀文字也能提取
+    assert normalize_invoice_date("2026/10/1 12:30") == "2026/10/1"
+    assert normalize_invoice_date("开票日期：2026年10月1日") == "2026/10/1"
+    assert normalize_invoice_date("2026-9-5") == "2026/9/5"
+    assert normalize_invoice_date("不是日期") == ""
+    assert normalize_invoice_date("2026/13/1") == ""  #非法月份不硬凑
+
+
 def test_normalize_invoice_date():
     #日期统一成斜杠格式
     assert normalize_invoice_date("2026年10月1日") == "2026/10/1"
